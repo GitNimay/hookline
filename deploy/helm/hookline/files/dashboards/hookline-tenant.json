@@ -257,7 +257,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(jetstream_consumer_num_pending{consumer_name=\"deliver_$tenant\"})",
+          "expr": "sum({__name__=~\"(nats|jetstream)_consumer_num_pending\",consumer_name=\"deliver_$tenant\"})",
           "legendFormat": "__auto",
           "refId": "A"
         }

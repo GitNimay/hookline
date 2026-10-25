@@ -424,7 +424,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (consumer_name) (jetstream_consumer_num_pending{stream_name=\"DELIVERIES\"})",
+          "expr": "sum by (consumer_name) ({__name__=~\"(nats|jetstream)_consumer_num_pending\",stream_name=\"DELIVERIES\"})",
           "legendFormat": "{{consumer_name}}",
           "refId": "A"
         }
@@ -470,7 +470,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(jetstream_consumer_num_pending{stream_name=\"EVENTS\"})",
+          "expr": "sum({__name__=~\"(nats|jetstream)_consumer_num_pending\",stream_name=\"EVENTS\"})",
           "legendFormat": "events not dispatched",
           "refId": "B"
         }

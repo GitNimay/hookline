@@ -15,7 +15,7 @@ postgres:
   storageClass: ""
   # kubernetes.io/basic-auth Secret with the hookline user's password.
   credentialsSecret: hookline-pg-credentials
-  maxConnections: "200"
+  maxConnections: "300"
   sharedBuffers: 256MB
   resources:
     requests: { cpu: 100m, memory: 256Mi }

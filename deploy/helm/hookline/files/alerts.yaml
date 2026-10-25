@@ -71,7 +71,7 @@ groups:
           description: "{{ $value }} events are stored but not queued."
           runbook_url: https://github.com/GitNimay/hookline/blob/main/docs/runbook.md#hooklineoutboxbacklog
       - alert: HooklineDeliveriesLag
-        expr: sum(jetstream_consumer_num_pending{stream_name="DELIVERIES"}) > 10000
+        expr: sum({__name__=~"(nats|jetstream)_consumer_num_pending",stream_name="DELIVERIES"}) > 10000
         for: 10m
         labels: { severity: warning }
         annotations:

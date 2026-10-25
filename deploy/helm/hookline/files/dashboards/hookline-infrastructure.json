@@ -38,7 +38,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (stream_name) (jetstream_stream_total_messages)",
+          "expr": "sum by (stream_name) ({__name__=~\"(nats|jetstream)_stream_total_messages\"})",
           "legendFormat": "{{stream_name}}",
           "refId": "A"
         }
@@ -75,7 +75,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (stream_name) (jetstream_consumer_num_pending)",
+          "expr": "sum by (stream_name) ({__name__=~\"(nats|jetstream)_consumer_num_pending\"})",
           "legendFormat": "pending {{stream_name}}",
           "refId": "A"
         },
@@ -84,7 +84,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (stream_name) (jetstream_consumer_num_ack_pending)",
+          "expr": "sum by (stream_name) ({__name__=~\"(nats|jetstream)_consumer_num_ack_pending\"})",
           "legendFormat": "ack pending {{stream_name}}",
           "refId": "B"
         }
@@ -121,7 +121,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (stream_name) (rate(jetstream_consumer_num_redelivered[5m]))",
+          "expr": "sum by (stream_name) (rate({__name__=~\"(nats|jetstream)_consumer_num_redelivered\"}[5m]))",
           "legendFormat": "__auto",
           "refId": "A"
         }

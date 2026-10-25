@@ -36,7 +36,7 @@ services:
     secret: true
     env:
       WORKER_CONCURRENCY: "100"
-      DB_MAX_CONNS: "30"
+      DB_MAX_CONNS: "10"
       DB_SYNCHRONOUS_COMMIT: "false"
     resources:
       requests: { cpu: 100m, memory: 96Mi }
@@ -46,7 +46,7 @@ services:
       type: prometheus
       minReplicas: 1
       maxReplicas: 8
-      query: sum(jetstream_consumer_num_pending{stream_name="DELIVERIES"})
+      query: sum({__name__=~"(nats|jetstream)_consumer_num_pending",stream_name="DELIVERIES"})
       threshold: "500"
   chaos-customer:
     enabled: false

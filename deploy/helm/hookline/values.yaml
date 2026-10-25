@@ -59,6 +59,8 @@ defaults:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 500m, memory: 256Mi }
 
+# Connection budget: sum over services of maxReplicas x DB_MAX_CONNS must stay below
+# Postgres max_connections (300, deploy/helm/infra): 6x10 + 1x10 + 6x10 + 10x10 + 1x5 = 235.
 services:
   ingest:
     enabled: true
@@ -66,6 +68,8 @@ services:
     http: true
     grpc: true
     secret: true
+    env:
+      DB_MAX_CONNS: "10"
     hpa: { enabled: true, minReplicas: 2, maxReplicas: 6, cpu: 70 }
   control:
     enabled: true
@@ -73,10 +77,14 @@ services:
     http: true
     grpc: true
     secret: true
+    env:
+      DB_MAX_CONNS: "10"
   dispatcher:
     enabled: true
     replicas: 1
     secret: true
+    env:
+      DB_MAX_CONNS: "10"
     keda:
       enabled: true
       type: nats-jetstream
@@ -89,20 +97,23 @@ services:
     secret: true
     env:
       WORKER_CONCURRENCY: "100"
-      DB_MAX_CONNS: "30"
+      DB_MAX_CONNS: "10"
       DB_SYNCHRONOUS_COMMIT: "false" # ADR-010
     keda:
       enabled: true
       type: prometheus
       minReplicas: 1
-      maxReplicas: 20
+      # More workers than Postgres can serve only queue on connections (see budget above).
+      maxReplicas: 10
       # Scale on total pending delivery jobs across all tenant consumers.
-      query: sum(jetstream_consumer_num_pending{stream_name="DELIVERIES"})
+      query: sum({__name__=~"(nats|jetstream)_consumer_num_pending",stream_name="DELIVERIES"})
       threshold: "500"
   scheduler:
     enabled: true
     replicas: 1
     secret: true
+    env:
+      DB_MAX_CONNS: "5"
   chaos-customer:
     enabled: false
     replicas: 1

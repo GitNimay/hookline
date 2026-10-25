@@ -54,8 +54,8 @@ overview = dashboard("hookline-overview", "Hookline overview", [
     panel("End-to-end latency (ingest to success)", [(q(0.5, "hookline_delivery_end_to_end_seconds"), "p50"), (q(0.95, "hookline_delivery_end_to_end_seconds"), "p95"), (q(0.99, "hookline_delivery_end_to_end_seconds"), "p99")], 0, 8, unit="s"),
     panel("Ingest API latency", [(q(0.5, "hookline_ingest_request_duration_seconds"), "p50"), (q(0.99, "hookline_ingest_request_duration_seconds"), "p99")], 8, 8, unit="s"),
     panel("Worker pods / in-flight", [('count(up{service="worker"} == 1)', "worker pods"), ('sum(hookline_worker_inflight)', "in-flight jobs")], 16, 8),
-    panel("Queue lag per tenant (pending deliveries)", 'sum by (consumer_name) (jetstream_consumer_num_pending{stream_name="DELIVERIES"})', 0, 16, w=12, legend="{{consumer_name}}"),
-    panel("Outbox pending / dispatcher lag", [('max(hookline_outbox_pending)', "outbox"), ('sum(jetstream_consumer_num_pending{stream_name="EVENTS"})', "events not dispatched")], 12, 16, w=12),
+    panel("Queue lag per tenant (pending deliveries)", 'sum by (consumer_name) ({__name__=~"(nats|jetstream)_consumer_num_pending",stream_name="DELIVERIES"})', 0, 16, w=12, legend="{{consumer_name}}"),
+    panel("Outbox pending / dispatcher lag", [('max(hookline_outbox_pending)', "outbox"), ('sum({__name__=~"(nats|jetstream)_consumer_num_pending",stream_name="EVENTS"})', "events not dispatched")], 12, 16, w=12),
     panel("Breaker transitions", 'sum by (to_state) (increase(hookline_circuit_breaker_transitions_total[5m]))', 0, 24, w=12, legend="{{to_state}}"),
     panel("Attempt errors by kind", 'sum by (error_kind) (rate(hookline_delivery_attempts_total{outcome!="success"}[5m]))', 12, 24, w=12, unit="reqps", legend="{{error_kind}}"),
 ])
@@ -68,15 +68,15 @@ tenant = dashboard("hookline-tenant", "Hookline tenant drill-down", [
     panel("Success rate (5m)", SUCCESS % (TS, T), 16, 0, kind="stat", unit="percentunit"),
     panel("End-to-end latency", [(q(0.5, "hookline_delivery_end_to_end_seconds", sel=T), "p50"), (q(0.99, "hookline_delivery_end_to_end_seconds", sel=T), "p99")], 0, 8, unit="s"),
     panel("Retrying / dead", [('sum(hookline_deliveries_retrying' + T + ')', "retrying"), ('sum(increase(hookline_deliveries_dead_total' + T + '[1h]))', "dead / h")], 8, 8),
-    panel("Queue lag", 'sum(jetstream_consumer_num_pending{consumer_name="deliver_$tenant"})', 16, 8),
+    panel("Queue lag", 'sum({__name__=~"(nats|jetstream)_consumer_num_pending",consumer_name="deliver_$tenant"})', 16, 8),
     panel("Rate limited (all tenants)", 'sum by (kind) (rate(hookline_rate_limited_total[1m]))', 0, 16, w=12, unit="reqps", legend="{{kind}}"),
     panel("Ingest rejections", 'sum(rate(hookline_events_ingested_total{result="rejected"' + TS + '}[1m]))', 12, 16, w=12, unit="reqps"),
 ], tenant_var=True)
 
 infra = dashboard("hookline-infra", "Hookline infrastructure", [
-    panel("NATS stream messages", 'sum by (stream_name) (jetstream_stream_total_messages)', 0, 0, legend="{{stream_name}}"),
-    panel("NATS consumer pending / ack pending", [('sum by (stream_name) (jetstream_consumer_num_pending)', "pending {{stream_name}}"), ('sum by (stream_name) (jetstream_consumer_num_ack_pending)', "ack pending {{stream_name}}")], 8, 0),
-    panel("NATS redeliveries /s", 'sum by (stream_name) (rate(jetstream_consumer_num_redelivered[5m]))', 16, 0),
+    panel("NATS stream messages", 'sum by (stream_name) ({__name__=~"(nats|jetstream)_stream_total_messages"})', 0, 0, legend="{{stream_name}}"),
+    panel("NATS consumer pending / ack pending", [('sum by (stream_name) ({__name__=~"(nats|jetstream)_consumer_num_pending"})', "pending {{stream_name}}"), ('sum by (stream_name) ({__name__=~"(nats|jetstream)_consumer_num_ack_pending"})', "ack pending {{stream_name}}")], 8, 0),
+    panel("NATS redeliveries /s", 'sum by (stream_name) (rate({__name__=~"(nats|jetstream)_consumer_num_redelivered"}[5m]))', 16, 0),
     panel("DB pool connections", [('sum by (service) (hookline_db_pool_acquired_connections)', "in use {{service}}"), ('sum by (service) (hookline_db_pool_total_connections)', "open {{service}}")], 0, 8),
     panel("DB pool wait", 'sum by (service) (rate(hookline_db_pool_acquire_seconds_total[5m]))', 8, 8, unit="s"),
     panel("Postgres connections", [('sum(pg_stat_activity_count)', "active"), ('max(pg_settings_max_connections)', "max")], 16, 8),

@@ -114,8 +114,8 @@ cluster-down: ## Delete the local k3d cluster
 
 cluster-reset: cluster-down cluster-up ## Recreate the cluster from scratch
 
-deploy-local: ## Build images, import them into k3d and install the Hookline chart
-	$(MAKE) images VERSION=local
+deploy-local: VERSION=local
+deploy-local: images ## Build images, import them into k3d and install the Hookline chart
 	k3d image import -c hookline $(addprefix hookline/,$(addsuffix :local,$(SERVICES)))
 	$(HELMFILE) -e local sync --selector name=hookline --skip-needs
 
