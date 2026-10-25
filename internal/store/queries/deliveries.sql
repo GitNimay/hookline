@@ -7,28 +7,36 @@ ON CONFLICT (event_id, endpoint_id) DO NOTHING;
 -- name: ListEventDeliveries :many
 SELECT * FROM deliveries WHERE event_id = $1;
 
--- name: ClaimDelivery :one
--- Locks a delivery for one attempt. No row means the job is stale, a duplicate, or in flight elsewhere.
-UPDATE deliveries
-SET locked_until = now() + make_interval(secs => sqlc.arg(lock_secs)::float8)
-WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id)
-  AND status IN ('pending', 'retrying') AND attempt_count = sqlc.arg(attempt_count)
-  AND (locked_until IS NULL OR locked_until < now())
-RETURNING *;
+-- name: ClaimDeliveryWithEvent :one
+-- ClaimDelivery plus the event payload, in one round trip.
+WITH c AS (
+    UPDATE deliveries
+    SET locked_until = now() + make_interval(secs => sqlc.arg(lock_secs)::float8)
+    WHERE deliveries.id = sqlc.arg(id) AND deliveries.tenant_id = sqlc.arg(tenant_id)
+      AND deliveries.status IN ('pending', 'retrying') AND deliveries.attempt_count = sqlc.arg(attempt_count)
+      AND (deliveries.locked_until IS NULL OR deliveries.locked_until < now())
+    RETURNING deliveries.id, deliveries.event_id, deliveries.attempt_count
+)
+SELECT c.id, c.attempt_count, e.event_type, e.payload, e.occurred_at, e.created_at AS event_created_at
+FROM c JOIN events e ON e.id = c.event_id;
 
--- name: CompleteAttempt :execrows
-UPDATE deliveries
-SET status = sqlc.arg(status), attempt_count = attempt_count + 1,
-    next_attempt_at = sqlc.narg(next_attempt_at), last_attempt_at = now(),
-    last_status_code = sqlc.arg(last_status_code), last_error = sqlc.arg(last_error),
-    dead_reason = sqlc.arg(dead_reason),
-    succeeded_at = CASE WHEN sqlc.arg(status) = 'succeeded' THEN now() ELSE NULL END,
-    locked_until = NULL, updated_at = now()
-WHERE id = sqlc.arg(id) AND attempt_count = sqlc.arg(attempt_count) AND status IN ('pending', 'retrying');
-
--- name: InsertAttempt :exec
+-- name: RecordAttempt :execrows
+-- Completes an attempt and stores its log row atomically. 0 rows: completed elsewhere.
+WITH u AS (
+    UPDATE deliveries
+    SET status = sqlc.arg(status), attempt_count = attempt_count + 1,
+        next_attempt_at = sqlc.narg(next_attempt_at), last_attempt_at = now(),
+        last_status_code = sqlc.arg(status_code), last_error = sqlc.arg(error_message),
+        dead_reason = sqlc.arg(dead_reason),
+        succeeded_at = CASE WHEN sqlc.arg(status) = 'succeeded' THEN now() ELSE NULL END,
+        locked_until = NULL, updated_at = now()
+    WHERE deliveries.id = sqlc.arg(delivery_id) AND deliveries.attempt_count = sqlc.arg(attempt_count) AND deliveries.status IN ('pending', 'retrying')
+    RETURNING deliveries.id, deliveries.tenant_id
+)
 INSERT INTO delivery_attempts (id, delivery_id, tenant_id, attempt_number, started_at, duration_ms, status_code, error_kind, error_message, response_body_snippet)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+SELECT sqlc.arg(attempt_id), u.id, u.tenant_id, sqlc.arg(attempt_count)::int + 1, sqlc.arg(started_at), sqlc.arg(duration_ms),
+       sqlc.arg(status_code), sqlc.arg(error_kind), sqlc.arg(error_message), sqlc.arg(response_body_snippet)
+FROM u;
 
 -- name: DeferDelivery :execrows
 -- Reschedules without counting an attempt (circuit open).
@@ -46,7 +54,7 @@ WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id) AND attempt_count = 
 -- name: ClaimDueDeliveries :many
 -- Takes a lease on due retries by pushing next_attempt_at forward; if the publish is lost, the lease expires and it is claimed again.
 WITH due AS (
-    SELECT id FROM deliveries
+    SELECT id, next_attempt_at AS due_at FROM deliveries
     WHERE status = 'retrying' AND next_attempt_at <= now()
     ORDER BY next_attempt_at
     LIMIT sqlc.arg(batch_size)
@@ -55,7 +63,7 @@ WITH due AS (
 UPDATE deliveries d
 SET next_attempt_at = now() + make_interval(secs => sqlc.arg(lease_secs)::float8), updated_at = now()
 FROM due WHERE d.id = due.id
-RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.attempt_count, d.next_attempt_at;
+RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.attempt_count, d.next_attempt_at, due.due_at::timestamptz AS due_at;
 
 -- name: ClaimStalePending :many
 WITH stale AS (

@@ -66,7 +66,7 @@ func (s *Scheduler) PublishDue(ctx context.Context) (int, error) {
 	}
 	for _, r := range rows {
 		nonce := strconv.FormatInt(r.NextAttemptAt.UnixMilli(), 10)
-		if err := publishJob(ctx, s.Queue, jobRef{ID: r.ID, TenantID: r.TenantID, EventID: r.EventID, EndpointID: r.EndpointID, AttemptCount: r.AttemptCount}, nonce); err != nil {
+		if err := publishJob(ctx, s.Queue, jobRef{ID: r.ID, TenantID: r.TenantID, EventID: r.EventID, EndpointID: r.EndpointID, AttemptCount: r.AttemptCount, Due: r.DueAt}, nonce); err != nil {
 			// The lease brings it back; no need to fail the batch.
 			s.Log.Warn("publish retry job", "delivery_id", domain.FormatID(domain.PrefixDelivery, r.ID), "err", err)
 			continue

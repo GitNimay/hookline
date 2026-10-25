@@ -290,18 +290,17 @@ func (w *Worker) handle(ctx context.Context, job *pb.DeliveryJob, log *slog.Logg
 		}
 	}
 
-	d, err := q.ClaimDelivery(dbctx, store.ClaimDeliveryParams{ID: ids.delivery, TenantID: ids.tenant, AttemptCount: expected, LockSecs: w.LockFor.Seconds()})
+	d, err := q.ClaimDeliveryWithEvent(dbctx, store.ClaimDeliveryWithEventParams{ID: ids.delivery, TenantID: ids.tenant, AttemptCount: expected, LockSecs: w.LockFor.Seconds()})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return w.notClaimed(dbctx, q, ids, expected)
 	}
 	if err != nil {
 		return action{}, err
 	}
-	ev, err := q.GetEvent(dbctx, store.GetEventParams{ID: ids.event, TenantID: ids.tenant})
-	if err != nil {
-		return action{}, notFound(err)
+	if job.ScheduledUnixMs > 0 {
+		telemetry.ScheduleLag.Observe(max(0, time.Since(time.UnixMilli(job.ScheduledUnixMs)).Seconds()))
 	}
-	body, err := delivery.Envelope(ev.EventType, ev.OccurredAt, ev.Payload)
+	body, err := delivery.Envelope(d.EventType, d.OccurredAt, d.Payload)
 	if err != nil {
 		return action{}, err
 	}
@@ -313,7 +312,7 @@ func (w *Worker) handle(ctx context.Context, job *pb.DeliveryJob, log *slog.Logg
 
 	outcome, kind := delivery.Classify(res.StatusCode, res.Err)
 	next := delivery.Decide(outcome, int(job.Attempt), w.Schedule, res.StatusCode, delivery.ParseRetryAfter(res.RetryAfter, time.Now()), rand.Float64()) //nolint:gosec // jitter, not security
-	if err := w.record(ctx, ids, job, ep, d, res, kind, next); err != nil {
+	if err := w.record(ctx, ids, ep, d.AttemptCount, res, kind, next); err != nil {
 		return action{}, err
 	}
 
@@ -321,7 +320,7 @@ func (w *Worker) handle(ctx context.Context, job *pb.DeliveryJob, log *slog.Logg
 	telemetry.AttemptDuration.WithLabelValues(outcomeLabel(outcome)).Observe(res.Duration.Seconds())
 	switch next.Status {
 	case domain.StatusSucceeded:
-		telemetry.EndToEnd.WithLabelValues(job.TenantId).Observe(time.Since(ev.CreatedAt).Seconds())
+		telemetry.EndToEnd.WithLabelValues(job.TenantId).Observe(time.Since(d.EventCreatedAt).Seconds())
 	case domain.StatusDead:
 		telemetry.DeliveriesDead.WithLabelValues(job.TenantId, next.DeadReason).Inc()
 		log.WarnContext(ctx, "delivery dead", "reason", next.DeadReason, "status_code", res.StatusCode, "error_kind", kind)
@@ -384,8 +383,9 @@ func (w *Worker) notClaimed(ctx context.Context, q *store.Queries, ids jobIDs, e
 	return action{}, nil
 }
 
-// record stores the attempt and the delivery's new state in one transaction.
-func (w *Worker) record(ctx context.Context, ids jobIDs, job *pb.DeliveryJob, ep workerEndpoint, d store.Delivery, res delivery.Result, kind string, next delivery.Decision) error {
+// record stores the attempt and the delivery's new state in one atomic statement,
+// then updates the endpoint's health when it changed.
+func (w *Worker) record(ctx context.Context, ids jobIDs, ep workerEndpoint, attemptCount int32, res delivery.Result, kind string, next delivery.Decision) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var nextAt *time.Time
@@ -399,38 +399,30 @@ func (w *Worker) record(ctx context.Context, ids jobIDs, job *pb.DeliveryJob, ep
 	} else if kind == domain.KindHTTPStatus {
 		errMsg = http.StatusText(res.StatusCode)
 	}
-	return pgx.BeginTxFunc(ctx, w.Pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		q := store.New(tx)
-		n, err := q.CompleteAttempt(ctx, store.CompleteAttemptParams{
-			ID: ids.delivery, AttemptCount: d.AttemptCount, Status: next.Status, NextAttemptAt: nextAt,
-			LastStatusCode: int32(res.StatusCode), LastError: errMsg, DeadReason: next.DeadReason,
-		})
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return nil // completed elsewhere meanwhile; keep the first result
-		}
-		if err := q.InsertAttempt(ctx, store.InsertAttemptParams{
-			ID: domain.NewID(), DeliveryID: ids.delivery, TenantID: ids.tenant, AttemptNumber: job.Attempt,
-			StartedAt: time.Now().Add(-res.Duration), DurationMs: int32(res.Duration.Milliseconds()),
-			StatusCode: int32(res.StatusCode), ErrorKind: kind, ErrorMessage: errMsg, ResponseBodySnippet: res.Body,
-		}); err != nil {
-			return err
-		}
-		switch {
-		case next.DeadReason == domain.ReasonEndpointGone:
-			_, err = q.SetEndpointStatus(ctx, store.SetEndpointStatusParams{ID: ids.endpoint, TenantID: ids.tenant, Status: "disabled", DisabledReason: "gone"})
-			if errors.Is(err, pgx.ErrNoRows) {
-				err = nil
-			}
-		case next.Status == domain.StatusSucceeded && ep.ep.FailingSince != nil:
-			err = q.ClearEndpointFailing(ctx, ids.endpoint)
-		case next.Status != domain.StatusSucceeded && ep.ep.FailingSince == nil:
-			err = q.MarkEndpointFailing(ctx, ids.endpoint)
-		}
-		return err
+	q := store.New(w.Pool)
+	n, err := q.RecordAttempt(ctx, store.RecordAttemptParams{
+		DeliveryID: ids.delivery, AttemptCount: attemptCount, Status: next.Status, NextAttemptAt: nextAt, DeadReason: next.DeadReason,
+		AttemptID: domain.NewID(), StartedAt: time.Now().Add(-res.Duration), DurationMs: int32(res.Duration.Milliseconds()),
+		StatusCode: int32(res.StatusCode), ErrorKind: kind, ErrorMessage: errMsg, ResponseBodySnippet: res.Body,
 	})
+	if err != nil || n == 0 {
+		return err // n == 0: completed elsewhere meanwhile; keep the first result
+	}
+	switch {
+	case next.DeadReason == domain.ReasonEndpointGone:
+		_, err = q.SetEndpointStatus(ctx, store.SetEndpointStatusParams{ID: ids.endpoint, TenantID: ids.tenant, Status: "disabled", DisabledReason: "gone"})
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = nil
+		}
+	case next.Status == domain.StatusSucceeded && ep.ep.FailingSince != nil:
+		err = q.ClearEndpointFailing(ctx, ids.endpoint)
+	case next.Status != domain.StatusSucceeded && ep.ep.FailingSince == nil:
+		err = q.MarkEndpointFailing(ctx, ids.endpoint)
+	}
+	if err != nil {
+		w.Log.WarnContext(ctx, "update endpoint health", "endpoint_id", domain.FormatID(domain.PrefixEndpoint, ids.endpoint), "err", err)
+	}
+	return nil
 }
 
 func truncate(s string, n int) string {

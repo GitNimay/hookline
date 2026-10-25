@@ -116,6 +116,7 @@ services:
       RETRY_SCHEDULE: ${RETRY_SCHEDULE:-demo}
       SSRF_ALLOWLIST: chaos-customer
       WORKER_CONCURRENCY: "200"
+      DB_MAX_CONNS: "40"
 
   scheduler:
     <<: *service
@@ -135,10 +136,24 @@ services:
     depends_on: {}
 
   nats-exporter:
-    image: natsio/prometheus-nats-exporter:0.17.3
+    image: natsio/prometheus-nats-exporter:0.18.0
     command: ["-varz", "-jsz=all", "-connz", "http://nats:8222"]
     depends_on:
       nats: { condition: service_healthy }
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.20.0
+    environment:
+      DATA_SOURCE_NAME: postgres://hookline:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/hookline?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.82.0
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis: { condition: service_healthy }
 
   prometheus:
     image: prom/prometheus:v3.12.0

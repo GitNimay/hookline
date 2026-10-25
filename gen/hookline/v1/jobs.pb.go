@@ -90,9 +90,11 @@ type DeliveryJob struct {
 	EndpointId string                 `protobuf:"bytes,3,opt,name=endpoint_id,json=endpointId,proto3" json:"endpoint_id,omitempty"`
 	TenantId   string                 `protobuf:"bytes,4,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
 	// The attempt number this job performs (attempt_count + 1 when published).
-	Attempt       int32 `protobuf:"varint,5,opt,name=attempt,proto3" json:"attempt,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Attempt int32 `protobuf:"varint,5,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	// When this attempt was due (Unix ms); the SLO measures lateness against it.
+	ScheduledUnixMs int64 `protobuf:"varint,6,opt,name=scheduled_unix_ms,json=scheduledUnixMs,proto3" json:"scheduled_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *DeliveryJob) Reset() {
@@ -160,6 +162,13 @@ func (x *DeliveryJob) GetAttempt() int32 {
 	return 0
 }
 
+func (x *DeliveryJob) GetScheduledUnixMs() int64 {
+	if x != nil {
+		return x.ScheduledUnixMs
+	}
+	return 0
+}
+
 var File_hookline_v1_jobs_proto protoreflect.FileDescriptor
 
 const file_hookline_v1_jobs_proto_rawDesc = "" +
@@ -169,7 +178,7 @@ const file_hookline_v1_jobs_proto_rawDesc = "" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x1b\n" +
 	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12\x1d\n" +
 	"\n" +
-	"event_type\x18\x03 \x01(\tR\teventType\"\xa1\x01\n" +
+	"event_type\x18\x03 \x01(\tR\teventType\"\xcd\x01\n" +
 	"\vDeliveryJob\x12\x1f\n" +
 	"\vdelivery_id\x18\x01 \x01(\tR\n" +
 	"deliveryId\x12\x19\n" +
@@ -177,7 +186,8 @@ const file_hookline_v1_jobs_proto_rawDesc = "" +
 	"\vendpoint_id\x18\x03 \x01(\tR\n" +
 	"endpointId\x12\x1b\n" +
 	"\ttenant_id\x18\x04 \x01(\tR\btenantId\x12\x18\n" +
-	"\aattempt\x18\x05 \x01(\x05R\aattemptB\xa2\x01\n" +
+	"\aattempt\x18\x05 \x01(\x05R\aattempt\x12*\n" +
+	"\x11scheduled_unix_ms\x18\x06 \x01(\x03R\x0fscheduledUnixMsB\xa2\x01\n" +
 	"\x0fcom.hookline.v1B\tJobsProtoP\x01Z7github.com/GitNimay/hookline/gen/hookline/v1;hooklinev1\xa2\x02\x03HXX\xaa\x02\vHookline.V1\xca\x02\vHookline\\V1\xe2\x02\x17Hookline\\V1\\GPBMetadata\xea\x02\fHookline::V1b\x06proto3"
 
 var (

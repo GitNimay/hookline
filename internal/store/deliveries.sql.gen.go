@@ -12,55 +12,58 @@ import (
 	"github.com/google/uuid"
 )
 
-const claimDelivery = `-- name: ClaimDelivery :one
-UPDATE deliveries
-SET locked_until = now() + make_interval(secs => $1::float8)
-WHERE id = $2 AND tenant_id = $3
-  AND status IN ('pending', 'retrying') AND attempt_count = $4
-  AND (locked_until IS NULL OR locked_until < now())
-RETURNING id, tenant_id, event_id, endpoint_id, status, attempt_count, replay_count, next_attempt_at, last_attempt_at, last_status_code, last_error, dead_reason, succeeded_at, locked_until, created_at, updated_at
+const claimDeliveryWithEvent = `-- name: ClaimDeliveryWithEvent :one
+WITH c AS (
+    UPDATE deliveries
+    SET locked_until = now() + make_interval(secs => $1::float8)
+    WHERE deliveries.id = $2 AND deliveries.tenant_id = $3
+      AND deliveries.status IN ('pending', 'retrying') AND deliveries.attempt_count = $4
+      AND (deliveries.locked_until IS NULL OR deliveries.locked_until < now())
+    RETURNING deliveries.id, deliveries.event_id, deliveries.attempt_count
+)
+SELECT c.id, c.attempt_count, e.event_type, e.payload, e.occurred_at, e.created_at AS event_created_at
+FROM c JOIN events e ON e.id = c.event_id
 `
 
-type ClaimDeliveryParams struct {
+type ClaimDeliveryWithEventParams struct {
 	LockSecs     float64
 	ID           uuid.UUID
 	TenantID     uuid.UUID
 	AttemptCount int32
 }
 
-// Locks a delivery for one attempt. No row means the job is stale, a duplicate, or in flight elsewhere.
-func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (Delivery, error) {
-	row := q.db.QueryRow(ctx, claimDelivery,
+type ClaimDeliveryWithEventRow struct {
+	ID             uuid.UUID
+	AttemptCount   int32
+	EventType      string
+	Payload        []byte
+	OccurredAt     time.Time
+	EventCreatedAt time.Time
+}
+
+// ClaimDelivery plus the event payload, in one round trip.
+func (q *Queries) ClaimDeliveryWithEvent(ctx context.Context, arg ClaimDeliveryWithEventParams) (ClaimDeliveryWithEventRow, error) {
+	row := q.db.QueryRow(ctx, claimDeliveryWithEvent,
 		arg.LockSecs,
 		arg.ID,
 		arg.TenantID,
 		arg.AttemptCount,
 	)
-	var i Delivery
+	var i ClaimDeliveryWithEventRow
 	err := row.Scan(
 		&i.ID,
-		&i.TenantID,
-		&i.EventID,
-		&i.EndpointID,
-		&i.Status,
 		&i.AttemptCount,
-		&i.ReplayCount,
-		&i.NextAttemptAt,
-		&i.LastAttemptAt,
-		&i.LastStatusCode,
-		&i.LastError,
-		&i.DeadReason,
-		&i.SucceededAt,
-		&i.LockedUntil,
-		&i.CreatedAt,
-		&i.UpdatedAt,
+		&i.EventType,
+		&i.Payload,
+		&i.OccurredAt,
+		&i.EventCreatedAt,
 	)
 	return i, err
 }
 
 const claimDueDeliveries = `-- name: ClaimDueDeliveries :many
 WITH due AS (
-    SELECT id FROM deliveries
+    SELECT id, next_attempt_at AS due_at FROM deliveries
     WHERE status = 'retrying' AND next_attempt_at <= now()
     ORDER BY next_attempt_at
     LIMIT $2
@@ -69,7 +72,7 @@ WITH due AS (
 UPDATE deliveries d
 SET next_attempt_at = now() + make_interval(secs => $1::float8), updated_at = now()
 FROM due WHERE d.id = due.id
-RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.attempt_count, d.next_attempt_at
+RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.attempt_count, d.next_attempt_at, due.due_at::timestamptz AS due_at
 `
 
 type ClaimDueDeliveriesParams struct {
@@ -84,6 +87,7 @@ type ClaimDueDeliveriesRow struct {
 	EndpointID    uuid.UUID
 	AttemptCount  int32
 	NextAttemptAt *time.Time
+	DueAt         time.Time
 }
 
 // Takes a lease on due retries by pushing next_attempt_at forward; if the publish is lost, the lease expires and it is claimed again.
@@ -103,6 +107,7 @@ func (q *Queries) ClaimDueDeliveries(ctx context.Context, arg ClaimDueDeliveries
 			&i.EndpointID,
 			&i.AttemptCount,
 			&i.NextAttemptAt,
+			&i.DueAt,
 		); err != nil {
 			return nil, err
 		}
@@ -166,43 +171,6 @@ func (q *Queries) ClaimStalePending(ctx context.Context, arg ClaimStalePendingPa
 		return nil, err
 	}
 	return items, nil
-}
-
-const completeAttempt = `-- name: CompleteAttempt :execrows
-UPDATE deliveries
-SET status = $1, attempt_count = attempt_count + 1,
-    next_attempt_at = $2, last_attempt_at = now(),
-    last_status_code = $3, last_error = $4,
-    dead_reason = $5,
-    succeeded_at = CASE WHEN $1 = 'succeeded' THEN now() ELSE NULL END,
-    locked_until = NULL, updated_at = now()
-WHERE id = $6 AND attempt_count = $7 AND status IN ('pending', 'retrying')
-`
-
-type CompleteAttemptParams struct {
-	Status         string
-	NextAttemptAt  *time.Time
-	LastStatusCode int32
-	LastError      string
-	DeadReason     string
-	ID             uuid.UUID
-	AttemptCount   int32
-}
-
-func (q *Queries) CompleteAttempt(ctx context.Context, arg CompleteAttemptParams) (int64, error) {
-	result, err := q.db.Exec(ctx, completeAttempt,
-		arg.Status,
-		arg.NextAttemptAt,
-		arg.LastStatusCode,
-		arg.LastError,
-		arg.DeadReason,
-		arg.ID,
-		arg.AttemptCount,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
 }
 
 const countRetryingByTenant = `-- name: CountRetryingByTenant :many
@@ -317,40 +285,6 @@ func (q *Queries) GetDelivery(ctx context.Context, arg GetDeliveryParams) (Deliv
 		&i.UpdatedAt,
 	)
 	return i, err
-}
-
-const insertAttempt = `-- name: InsertAttempt :exec
-INSERT INTO delivery_attempts (id, delivery_id, tenant_id, attempt_number, started_at, duration_ms, status_code, error_kind, error_message, response_body_snippet)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-`
-
-type InsertAttemptParams struct {
-	ID                  uuid.UUID
-	DeliveryID          uuid.UUID
-	TenantID            uuid.UUID
-	AttemptNumber       int32
-	StartedAt           time.Time
-	DurationMs          int32
-	StatusCode          int32
-	ErrorKind           string
-	ErrorMessage        string
-	ResponseBodySnippet string
-}
-
-func (q *Queries) InsertAttempt(ctx context.Context, arg InsertAttemptParams) error {
-	_, err := q.db.Exec(ctx, insertAttempt,
-		arg.ID,
-		arg.DeliveryID,
-		arg.TenantID,
-		arg.AttemptNumber,
-		arg.StartedAt,
-		arg.DurationMs,
-		arg.StatusCode,
-		arg.ErrorKind,
-		arg.ErrorMessage,
-		arg.ResponseBodySnippet,
-	)
-	return err
 }
 
 const killDelivery = `-- name: KillDelivery :execrows
@@ -532,6 +466,61 @@ func (q *Queries) ListEventDeliveries(ctx context.Context, eventID uuid.UUID) ([
 		return nil, err
 	}
 	return items, nil
+}
+
+const recordAttempt = `-- name: RecordAttempt :execrows
+WITH u AS (
+    UPDATE deliveries
+    SET status = $9, attempt_count = attempt_count + 1,
+        next_attempt_at = $10, last_attempt_at = now(),
+        last_status_code = $5, last_error = $7,
+        dead_reason = $11,
+        succeeded_at = CASE WHEN $9 = 'succeeded' THEN now() ELSE NULL END,
+        locked_until = NULL, updated_at = now()
+    WHERE deliveries.id = $12 AND deliveries.attempt_count = $2 AND deliveries.status IN ('pending', 'retrying')
+    RETURNING deliveries.id, deliveries.tenant_id
+)
+INSERT INTO delivery_attempts (id, delivery_id, tenant_id, attempt_number, started_at, duration_ms, status_code, error_kind, error_message, response_body_snippet)
+SELECT $1, u.id, u.tenant_id, $2::int + 1, $3, $4,
+       $5, $6, $7, $8
+FROM u
+`
+
+type RecordAttemptParams struct {
+	AttemptID           uuid.UUID
+	AttemptCount        int32
+	StartedAt           time.Time
+	DurationMs          int32
+	StatusCode          int32
+	ErrorKind           string
+	ErrorMessage        string
+	ResponseBodySnippet string
+	Status              string
+	NextAttemptAt       *time.Time
+	DeadReason          string
+	DeliveryID          uuid.UUID
+}
+
+// Completes an attempt and stores its log row atomically. 0 rows: completed elsewhere.
+func (q *Queries) RecordAttempt(ctx context.Context, arg RecordAttemptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordAttempt,
+		arg.AttemptID,
+		arg.AttemptCount,
+		arg.StartedAt,
+		arg.DurationMs,
+		arg.StatusCode,
+		arg.ErrorKind,
+		arg.ErrorMessage,
+		arg.ResponseBodySnippet,
+		arg.Status,
+		arg.NextAttemptAt,
+		arg.DeadReason,
+		arg.DeliveryID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const replayDelivery = `-- name: ReplayDelivery :one

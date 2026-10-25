@@ -17,4 +17,6 @@ message DeliveryJob {
   string tenant_id = 4;
   // The attempt number this job performs (attempt_count + 1 when published).
   int32 attempt = 5;
+  // When this attempt was due (Unix ms); the SLO measures lateness against it.
+  int64 scheduled_unix_ms = 6;
 }

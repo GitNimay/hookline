@@ -115,10 +115,9 @@ func (s *Ingest) ingest(ctx context.Context, reqs []*pb.SendEventRequest) ([]*pb
 
 	traceParent := telemetry.TraceParent(ctx)
 	out := make([]*pb.SendEventResponse, len(evs))
-	err = pgx.BeginTxFunc(ctx, s.Pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		q := store.New(tx)
+	insert := func(q *store.Queries) error {
 		for i, e := range evs {
-			id, err := q.InsertEvent(ctx, store.InsertEventParams{
+			id, err := q.InsertEventWithOutbox(ctx, store.InsertEventWithOutboxParams{
 				ID: domain.NewID(), TenantID: tenantID, EventType: e.typ, Payload: e.payload,
 				IdempotencyKey: e.key, OccurredAt: e.at, TraceParent: traceParent,
 			})
@@ -133,13 +132,16 @@ func (s *Ingest) ingest(ctx context.Context, reqs []*pb.SendEventRequest) ([]*pb
 			if err != nil {
 				return err
 			}
-			if err := q.InsertOutbox(ctx, store.InsertOutboxParams{EventID: id, TenantID: tenantID}); err != nil {
-				return err
-			}
 			out[i] = &pb.SendEventResponse{Id: domain.FormatID(domain.PrefixEvent, id)}
 		}
 		return nil
-	})
+	}
+	if len(evs) == 1 {
+		// One statement is already atomic: skip BEGIN/COMMIT round trips.
+		err = insert(store.New(s.Pool))
+	} else {
+		err = pgx.BeginTxFunc(ctx, s.Pool, pgx.TxOptions{}, func(tx pgx.Tx) error { return insert(store.New(tx)) })
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -133,14 +133,19 @@ func (q *Queries) GetEventIDByIdempotencyKey(ctx context.Context, arg GetEventID
 	return id, err
 }
 
-const insertEvent = `-- name: InsertEvent :one
-INSERT INTO events (id, tenant_id, event_type, payload, idempotency_key, occurred_at, trace_parent)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-RETURNING id
+const insertEventWithOutbox = `-- name: InsertEventWithOutbox :one
+WITH e AS (
+    INSERT INTO events (id, tenant_id, event_type, payload, idempotency_key, occurred_at, trace_parent)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+    RETURNING id, tenant_id
+), o AS (
+    INSERT INTO outbox (event_id, tenant_id) SELECT id, tenant_id FROM e RETURNING event_id
+)
+SELECT event_id FROM o
 `
 
-type InsertEventParams struct {
+type InsertEventWithOutboxParams struct {
 	ID             uuid.UUID
 	TenantID       uuid.UUID
 	EventType      string
@@ -150,9 +155,10 @@ type InsertEventParams struct {
 	TraceParent    string
 }
 
-// Returns no rows when the idempotency key already exists for the tenant.
-func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, insertEvent,
+// Event and outbox row in one atomic statement (one round trip). No row means the
+// idempotency key already exists for the tenant.
+func (q *Queries) InsertEventWithOutbox(ctx context.Context, arg InsertEventWithOutboxParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertEventWithOutbox,
 		arg.ID,
 		arg.TenantID,
 		arg.EventType,
@@ -161,23 +167,9 @@ func (q *Queries) InsertEvent(ctx context.Context, arg InsertEventParams) (uuid.
 		arg.OccurredAt,
 		arg.TraceParent,
 	)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
-}
-
-const insertOutbox = `-- name: InsertOutbox :exec
-INSERT INTO outbox (event_id, tenant_id) VALUES ($1, $2)
-`
-
-type InsertOutboxParams struct {
-	EventID  uuid.UUID
-	TenantID uuid.UUID
-}
-
-func (q *Queries) InsertOutbox(ctx context.Context, arg InsertOutboxParams) error {
-	_, err := q.db.Exec(ctx, insertOutbox, arg.EventID, arg.TenantID)
-	return err
+	var event_id uuid.UUID
+	err := row.Scan(&event_id)
+	return event_id, err
 }
 
 const listEvents = `-- name: ListEvents :many

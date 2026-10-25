@@ -62,6 +62,10 @@ var (
 	EndpointsAutoDisabled = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "hookline_endpoints_auto_disabled_total", Help: "Endpoints disabled after failing too long.",
 	})
+	ScheduleLag = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "hookline_delivery_schedule_lag_seconds", Help: "Delay between an attempt's due time and its start (SLO: 99.5% within 60 s).",
+		Buckets: []float64{.1, .5, 1, 2, 5, 10, 30, 60, 120, 300, 900},
+	})
 	BuildInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "hookline_build_info", Help: "Build version and commit.",
 	}, []string{"version", "commit"})

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -16,6 +17,7 @@ import (
 type jobRef struct {
 	ID, TenantID, EventID, EndpointID uuid.UUID
 	AttemptCount                      int32
+	Due                               time.Time // zero means now
 }
 
 // publishJob publishes the job for the delivery's next attempt. nonce makes the NATS
@@ -30,6 +32,10 @@ func publishJob(ctx context.Context, q *queue.Queue, r jobRef, nonce string) err
 		TenantId:   tenant,
 		Attempt:    r.AttemptCount + 1,
 	}
+	if r.Due.IsZero() {
+		r.Due = time.Now()
+	}
+	job.ScheduledUnixMs = r.Due.UnixMilli()
 	return q.PublishDelivery(ctx, tenant, job, domain.JobMsgID(dlv, job.Attempt, nonce))
 }
 

@@ -1,6 +1,6 @@
 # Hookline task runner. Run `make help` for targets.
 SHELL := bash
-GO_VERSION   := 1.27.1
+GO_VERSION   := 1.27.3
 BUF          := github.com/bufbuild/buf/cmd/buf@v1.75.0
 GOLANGCI     := github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 SQLC_IMAGE   := sqlc/sqlc:1.31.1

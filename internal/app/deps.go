@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/GitNimay/hookline/internal/config"
@@ -26,6 +27,7 @@ func OpenPostgres(ctx context.Context, c config.Postgres) (*pgxpool.Pool, error)
 	if err != nil {
 		return nil, err
 	}
+	registerPoolMetrics(pool)
 	return pool, nil
 }
 
@@ -54,5 +56,22 @@ func readyAll(checks ...func(context.Context) error) func(context.Context) error
 			}
 		}
 		return nil
+	}
+}
+
+// registerPoolMetrics exposes pgx pool stats. Re-registering (tests) keeps the first pool.
+func registerPoolMetrics(pool *pgxpool.Pool) {
+	g := func(name, help string, f func(*pgxpool.Stat) float64) prometheus.Collector {
+		return prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "hookline_db_pool_" + name, Help: help}, func() float64 { return f(pool.Stat()) })
+	}
+	for _, c := range []prometheus.Collector{
+		g("acquired_connections", "Connections in use.", func(s *pgxpool.Stat) float64 { return float64(s.AcquiredConns()) }),
+		g("idle_connections", "Idle connections.", func(s *pgxpool.Stat) float64 { return float64(s.IdleConns()) }),
+		g("total_connections", "Open connections.", func(s *pgxpool.Stat) float64 { return float64(s.TotalConns()) }),
+		g("max_connections", "Pool size limit.", func(s *pgxpool.Stat) float64 { return float64(s.MaxConns()) }),
+		g("acquire_seconds_total", "Total time spent waiting for a connection.", func(s *pgxpool.Stat) float64 { return s.AcquireDuration().Seconds() }),
+		g("empty_acquire_total", "Acquires that had to wait.", func(s *pgxpool.Stat) float64 { return float64(s.EmptyAcquireCount()) }),
+	} {
+		_ = prometheus.Register(c)
 	}
 }

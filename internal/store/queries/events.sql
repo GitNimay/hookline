@@ -1,15 +1,18 @@
--- name: InsertEvent :one
--- Returns no rows when the idempotency key already exists for the tenant.
-INSERT INTO events (id, tenant_id, event_type, payload, idempotency_key, occurred_at, trace_parent)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-RETURNING id;
+-- name: InsertEventWithOutbox :one
+-- Event and outbox row in one atomic statement (one round trip). No row means the
+-- idempotency key already exists for the tenant.
+WITH e AS (
+    INSERT INTO events (id, tenant_id, event_type, payload, idempotency_key, occurred_at, trace_parent)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+    RETURNING id, tenant_id
+), o AS (
+    INSERT INTO outbox (event_id, tenant_id) SELECT id, tenant_id FROM e RETURNING event_id
+)
+SELECT event_id FROM o;
 
 -- name: GetEventIDByIdempotencyKey :one
 SELECT id FROM events WHERE tenant_id = $1 AND idempotency_key = $2;
-
--- name: InsertOutbox :exec
-INSERT INTO outbox (event_id, tenant_id) VALUES ($1, $2);
 
 -- name: GetEvent :one
 SELECT * FROM events WHERE id = $1 AND tenant_id = $2;
