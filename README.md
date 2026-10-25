@@ -1,6 +1,5 @@
 # Hookline
 
-[![ci](https://github.com/GitNimay/hookline/actions/workflows/ci.yml/badge.svg)](https://github.com/GitNimay/hookline/actions/workflows/ci.yml)
 
 Self-hosted, multi-tenant webhook delivery in Go. Send an event once; Hookline stores it, fans it out to every subscribed endpoint, and delivers it as a signed [Standard Webhooks](https://www.standardwebhooks.com/) request with retries, circuit breakers, rate limits, per-tenant fairness and dead-letter replay.
 
