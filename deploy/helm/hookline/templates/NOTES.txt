@@ -1,0 +1,13 @@
+Hookline {{ .Values.image.tag }} is installed in namespace {{ .Release.Namespace }}.
+
+API (ingest + control):  http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.ingress.host }}
+{{- if (index .Values.services "chaos-customer").enabled }}
+Chaos customer:          http://{{ .Values.ingress.chaosHost }}
+{{- end }}
+
+Next steps:
+  kubectl -n {{ .Release.Namespace }} get pods
+  HOOKLINE_CONTROL_URL=http://{{ .Values.ingress.host }}:8080 HOOKLINE_INGEST_URL=http://{{ .Values.ingress.host }}:8080 \
+    CHAOS_URL=http://{{ .Values.ingress.chaosHost }}:8080 CHAOS_INTERNAL_URL=http://hookline-chaos-customer:8080 \
+    hookctl seed
+  Dashboards: Grafana -> folder "Hookline". Runbook: docs/runbook.md

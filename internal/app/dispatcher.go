@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
@@ -62,7 +61,7 @@ func (d *Dispatcher) match(ctx context.Context, tenant, typ string) ([]uuid.UUID
 // Handle processes one event message. The message is acked only after deliveries are
 // committed and their jobs published; any failure naks with a growing delay.
 func (d *Dispatcher) Handle(ctx context.Context, msg jetstream.Msg) {
-	ctx = telemetry.Extract(ctx, http.Header(msg.Headers()))
+	ctx = telemetry.Extract(ctx, msg.Headers())
 	ctx, span := telemetry.Tracer.Start(ctx, "dispatch")
 	defer span.End()
 	if err := d.handle(ctx, msg); err != nil {

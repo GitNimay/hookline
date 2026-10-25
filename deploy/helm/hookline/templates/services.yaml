@@ -1,0 +1,193 @@
+{{- /* One Deployment, Service, ServiceAccount, ServiceMonitor, PDB and HPA/ScaledObject per entry in .Values.services. */ -}}
+{{- $root := . -}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+{{- $ctx := dict "root" $root "name" $name }}
+{{- $res := $svc.resources | default $root.Values.defaults.resources }}
+{{- $autoscaled := or (and $svc.hpa $svc.hpa.enabled) (and $svc.keda $svc.keda.enabled) }}
+{{- $minReplicas := $svc.replicas | default 1 | int }}
+{{- if and $svc.hpa $svc.hpa.enabled }}{{ $minReplicas = $svc.hpa.minReplicas | int }}{{ end }}
+{{- if and $svc.keda $svc.keda.enabled }}{{ $minReplicas = $svc.keda.minReplicas | int }}{{ end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hookline-{{ $name }}
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hookline-{{ $name }}
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+spec:
+  {{- if not $autoscaled }}
+  replicas: {{ $svc.replicas | default 1 }}
+  {{- end }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: {{- include "hookline.selector" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "hookline.labels" $ctx | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $root.Template.BasePath "/configmap.yaml") $root | sha256sum }}
+    spec:
+      serviceAccountName: hookline-{{ $name }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext: {{- include "hookline.podSecurityContext" $root | nindent 8 }}
+      {{- with $root.Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if gt $minReplicas 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- include "hookline.selector" $ctx | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "hookline.image" $ctx }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          securityContext: {{- include "hookline.containerSecurityContext" $root | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: hookline-config
+            {{- if $svc.secret }}
+            - secretRef:
+                name: {{ $root.Values.existingSecret }}
+            {{- end }}
+          env:
+            - name: GOMEMLIMIT
+              value: {{ include "hookline.gomemlimit" $res | quote }}
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            {{- if $svc.grpc }}
+            - { name: grpc, containerPort: 9090 }
+            {{- end }}
+            {{- if $svc.http }}
+            - { name: http, containerPort: 8080 }
+            {{- end }}
+            - { name: admin, containerPort: 8081 }
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              sleep: { seconds: 3 }
+          resources: {{- toYaml $res | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hookline-{{ $name }}
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+spec:
+  selector: {{- include "hookline.selector" $ctx | nindent 4 }}
+  ports:
+    {{- if $svc.grpc }}
+    - { name: grpc, port: 9090, targetPort: grpc, appProtocol: grpc }
+    {{- end }}
+    {{- if $svc.http }}
+    - { name: http, port: 8080, targetPort: http }
+    {{- end }}
+    - { name: admin, port: 8081, targetPort: admin }
+{{- if $root.Values.metrics.serviceMonitor }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: hookline-{{ $name }}
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "hookline.selector" $ctx | nindent 6 }}
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 15s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_component]
+          targetLabel: service
+{{- end }}
+{{- if gt $minReplicas 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hookline-{{ $name }}
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {{- include "hookline.selector" $ctx | nindent 6 }}
+{{- end }}
+{{- if and $svc.hpa $svc.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hookline-{{ $name }}
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: hookline-{{ $name }} }
+  minReplicas: {{ $svc.hpa.minReplicas }}
+  maxReplicas: {{ $svc.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ $svc.hpa.cpu }} }
+{{- end }}
+{{- if and $svc.keda $svc.keda.enabled }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: hookline-{{ $name }}
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+spec:
+  scaleTargetRef: { name: hookline-{{ $name }} }
+  minReplicaCount: {{ $svc.keda.minReplicas }}
+  maxReplicaCount: {{ $svc.keda.maxReplicas }}
+  pollingInterval: 15
+  cooldownPeriod: 120
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown: { stabilizationWindowSeconds: 120 }
+  triggers:
+    {{- if eq $svc.keda.type "nats-jetstream" }}
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: {{ $root.Values.natsMonitoringEndpoint | quote }}
+        account: "$G"
+        stream: EVENTS
+        consumer: dispatcher
+        lagThreshold: {{ $svc.keda.lagThreshold | quote }}
+    {{- else }}
+    - type: prometheus
+      metadata:
+        serverAddress: {{ $root.Values.prometheusURL | quote }}
+        query: {{ $svc.keda.query | quote }}
+        threshold: {{ $svc.keda.threshold | quote }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

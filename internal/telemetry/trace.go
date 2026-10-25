@@ -2,7 +2,7 @@ package telemetry
 
 import (
 	"context"
-	"net/http"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -41,19 +41,48 @@ func SetupTracing(ctx context.Context, service, endpoint string, ratio float64) 
 	return tp.Shutdown, nil
 }
 
-// Inject writes the context's trace into h (NATS headers share http.Header's shape).
-func Inject(ctx context.Context, h http.Header) {
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(h))
+// Carrier adapts NATS (or HTTP) headers for trace propagation. Lookups ignore case:
+// NATS keeps header keys as written, so "traceparent" must match "Traceparent".
+type Carrier map[string][]string
+
+// Get returns the first value for key, matching case-insensitively.
+func (c Carrier) Get(key string) string {
+	if v := c[key]; len(v) > 0 {
+		return v[0]
+	}
+	for k, v := range c {
+		if len(v) > 0 && strings.EqualFold(k, key) {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+// Set stores key as given.
+func (c Carrier) Set(key, value string) { c[key] = []string{value} }
+
+// Keys lists the header keys.
+func (c Carrier) Keys() []string {
+	out := make([]string, 0, len(c))
+	for k := range c {
+		out = append(out, k)
+	}
+	return out
+}
+
+// Inject writes the context's trace into h.
+func Inject(ctx context.Context, h map[string][]string) {
+	otel.GetTextMapPropagator().Inject(ctx, Carrier(h))
 }
 
 // Extract returns ctx carrying the trace found in h.
-func Extract(ctx context.Context, h http.Header) context.Context {
-	return otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(h))
+func Extract(ctx context.Context, h map[string][]string) context.Context {
+	return otel.GetTextMapPropagator().Extract(ctx, Carrier(h))
 }
 
 // TraceParent returns the W3C traceparent of ctx, for storing with an event.
 func TraceParent(ctx context.Context) string {
-	h := http.Header{}
+	h := Carrier{}
 	Inject(ctx, h)
 	return h.Get("traceparent")
 }
@@ -63,5 +92,5 @@ func WithTraceParent(ctx context.Context, tp string) context.Context {
 	if tp == "" {
 		return ctx
 	}
-	return Extract(ctx, http.Header{"Traceparent": []string{tp}})
+	return Extract(ctx, map[string][]string{"traceparent": {tp}})
 }

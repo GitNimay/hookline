@@ -1,0 +1,25 @@
+# Local cluster: 1 server, 2 agents, a local registry, Traefik ingress on host ports 8080/8443.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: hookline
+servers: 1
+agents: 2
+image: rancher/k3s:v1.36.3-k3s1
+ports:
+  - port: 8080:80
+    nodeFilters: [loadbalancer]
+  - port: 8443:443
+    nodeFilters: [loadbalancer]
+registries:
+  create:
+    name: hookline-registry
+    host: "0.0.0.0"
+    hostPort: "5050"
+options:
+  k3d:
+    wait: true
+    timeout: 300s
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

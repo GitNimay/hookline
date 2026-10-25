@@ -179,7 +179,7 @@ services:
       - ../../dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
 
-  # Optional: `docker compose --profile tracing up` and set OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+  # Optional: `make compose-up-tracing` (profile "tracing"; services export OTLP to Alloy).
   tempo:
     image: grafana/tempo:2.10.0
     profiles: [tracing]
@@ -191,6 +191,14 @@ services:
     image: grafana/loki:3.7.0
     profiles: [tracing]
     ports: ["3100:3100"]
+
+  alloy:
+    image: grafana/alloy:v1.13.0
+    profiles: [tracing]
+    command: ["run", "/etc/alloy/config.alloy", "--server.http.listen-addr=0.0.0.0:12345"]
+    volumes:
+      - ./alloy.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
   pgdata:

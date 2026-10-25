@@ -1,0 +1,20 @@
+# Stage 1b: local k3d cluster on the developer PC.
+image:
+  prefix: hookline/
+  tag: local
+  pullPolicy: Never # images come from `k3d image import`
+
+config:
+  LOG_LEVEL: info
+  RETRY_SCHEDULE: demo
+  OTEL_TRACES_SAMPLER_RATIO: "1"
+  SSRF_ALLOWLIST: hookline-chaos-customer
+
+ingress:
+  host: hookline.localhost
+  tls:
+    enabled: false
+
+services:
+  chaos-customer:
+    enabled: true

@@ -1,0 +1,131 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $infra := .Values.infraNamespace }}
+{{- $mon := .Values.monitoringNamespace }}
+# Default deny for the release namespace; every service then gets only what it needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-common
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/part-of: hookline }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Prometheus scrapes the admin port.
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $mon }} } }
+      ports: [{ port: 8081 }]
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    # Traces to Alloy
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $mon }} } }
+      ports: [{ port: 4317 }]
+---
+# Postgres, NATS and Redis for the Go services and the migration job.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-infra-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [ingest, control, dispatcher, worker, scheduler, migrate] }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $infra }} } }
+      ports: [{ port: 5432 }, { port: 4222 }, { port: 6379 }]
+---
+# Public REST API through the ingress controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-api-ingress
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [ingest, control, chaos-customer] }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: traefik } }
+      ports: [{ port: 8080 }]
+---
+# control's internal gRPC (ListMatchingEndpoints) is reachable only from the dispatcher.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-control-grpc
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: control }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/component: dispatcher } }
+      ports: [{ port: 9090 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-dispatcher-egress
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: dispatcher }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app.kubernetes.io/component: control } }
+      ports: [{ port: 9090 }]
+---
+# Webhooks go to the internet (never to private ranges) and to the in-cluster chaos customer.
+# The SSRF dialer enforces the same rule in-process; this is defence in depth.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-webhook-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [worker, control] }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, 127.0.0.0/8]
+      ports: [{ port: 80 }, { port: 443 }, { port: 1024, endPort: 65535 }]
+    - to:
+        - podSelector: { matchLabels: { app.kubernetes.io/component: chaos-customer } }
+      ports: [{ port: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hookline-chaos-customer-ingress
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: chaos-customer }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/component, operator: In, values: [worker, control] }
+        # Alertmanager posts alerts to the chaos customer's /alerts sink.
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $mon }} } }
+      ports: [{ port: 8080 }]
+{{- end }}

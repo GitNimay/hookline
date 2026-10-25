@@ -1,0 +1,9 @@
+{{- if .Values.selfSignedIssuer }}
+# Self-signed issuer for LAN TLS on the home server Ingress.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+{{- end }}

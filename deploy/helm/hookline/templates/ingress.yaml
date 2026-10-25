@@ -1,0 +1,38 @@
+{{- if .Values.ingress.enabled }}
+# Event ingestion (/v1/events, /v1/events:batch, GET /v1/events...) goes to ingest; everything else to control.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hookline
+  labels: {{- include "hookline.labels" (dict "root" $ "name" "ingress") | nindent 4 }}
+  {{- if .Values.ingress.tls.enabled }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # Traefik matches Prefix as a string prefix, so this also covers /v1/events:batch.
+          - path: /v1/events
+            pathType: Prefix
+            backend: { service: { name: hookline-ingest, port: { name: http } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: hookline-control, port: { name: http } } }
+    {{- if (index .Values.services "chaos-customer").enabled }}
+    - host: {{ .Values.ingress.chaosHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: hookline-chaos-customer, port: { name: http } } }
+    {{- end }}
+{{- end }}

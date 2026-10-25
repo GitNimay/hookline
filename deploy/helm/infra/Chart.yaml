@@ -1,0 +1,5 @@
+apiVersion: v2
+name: hookline-infra
+description: Redis, a CloudNativePG Postgres cluster, backups and a self-signed issuer for Hookline
+type: application
+version: 0.1.0

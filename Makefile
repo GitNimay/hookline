@@ -13,8 +13,9 @@ GOBIN        := $(shell go env GOPATH)/bin
 export PATH  := $(GOBIN):$(PATH)
 # -race needs cgo; native Windows has no C toolchain, so CI (Linux) and WSL2 run it.
 RACE         ?= $(if $(filter Windows_NT,$(OS)),,-race)
+PYTHON       ?= $(if $(filter Windows_NT,$(OS)),python,python3)
 
-.PHONY: help tools gen lint test test-integration test-e2e cover build images compose-up compose-down compose-logs \
+.PHONY: help tools gen lint test test-integration test-e2e cover build images compose-up compose-up-tracing compose-down compose-logs \
         seed demo demo-full secrets-local cluster-up cluster-down cluster-reset deploy-local deploy-homeserver loadtest chaos
 
 help: ## Show targets
@@ -32,7 +33,11 @@ tools: ## Install pinned code generation and lint tools
 gen: ## Generate protobuf/gRPC/gateway/OpenAPI code and sqlc queries
 	buf lint
 	buf generate
-	docker run --rm -v "$(CURDIR):/src" -w /src $(SQLC_IMAGE) generate
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/src" -w /src $(SQLC_IMAGE) generate
+	$(PYTHON) dashboards/generate.py
+	mkdir -p deploy/helm/hookline/files/dashboards
+	cp alerts/hookline.prom.yaml deploy/helm/hookline/files/alerts.yaml
+	cp dashboards/*.json deploy/helm/hookline/files/dashboards/
 
 lint: ## Run golangci-lint and buf lint
 	golangci-lint run ./...
@@ -72,8 +77,12 @@ secrets-local: ## Create .env with random local secrets (keeps an existing one)
 	  echo "wrote .env with random secrets"; }
 
 compose-up: .env ## Start the full stack in Docker Compose
+	@mkdir -p .hookline && echo compose > .hookline/target
 	VERSION=$(VERSION) COMMIT=$(COMMIT) $(COMPOSE) up -d --build --wait
 	@echo "ingest http://localhost:8080  control http://localhost:8082  chaos http://localhost:9000  grafana http://localhost:3000"
+
+compose-up-tracing: .env ## Start the stack plus Tempo, Loki and Alloy, with tracing on
+	VERSION=$(VERSION) COMMIT=$(COMMIT) OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317 $(COMPOSE) --profile tracing up -d --build --wait
 
 compose-down: ## Stop the Compose stack and delete its volumes
 	$(COMPOSE) --profile tracing down -v
@@ -81,33 +90,38 @@ compose-down: ## Stop the Compose stack and delete its volumes
 compose-logs: ## Follow Compose logs
 	$(COMPOSE) logs -f --tail=100
 
-seed: .env ## Create demo tenants, keys, event types and chaos endpoints
-	set -a; . ./.env; set +a; go run ./cmd/hookctl seed
+seed: ## Create demo tenants, keys, event types and chaos endpoints (Compose or k3d)
+	bash scripts/hookctl.sh seed
 
 demo: ## Send demo traffic for 60 s across three tenants
-	set -a; . ./.env; set +a; go run ./cmd/hookctl send --tenants acme,globex,initech --rate 100 --duration 60s
-	@echo "Open Grafana: http://localhost:3000 (dashboard: Hookline overview)"
+	bash scripts/hookctl.sh send --tenants acme,globex,initech --rate 100 --duration 60s
+	@if [ "$$(cat .hookline/target 2>/dev/null)" = k8s ]; then echo "Grafana: http://grafana.localhost:8080 (folder Hookline)"; else echo "Grafana: http://localhost:3000 (folder Hookline)"; fi
 
 demo-full: ## The 5-minute demo script (docs/demo.md)
 	bash scripts/demo-full.sh
 
-cluster-up: ## Create the local k3d cluster and install third-party charts
-	k3d cluster create --config deploy/k3d/local.yaml
-	helmfile -f deploy/helmfile.yaml -e local apply
+HELMFILE := helmfile -f deploy/helmfile.yaml.gotmpl
+
+cluster-up: ## Create the local k3d cluster, secrets and all third-party charts
+	k3d cluster list hookline >/dev/null 2>&1 || k3d cluster create --config deploy/k3d/local.yaml
+	bash scripts/k8s-secrets.sh
+	$(HELMFILE) -e local sync --selector name!=hookline
+	@mkdir -p .hookline && echo k8s > .hookline/target
 
 cluster-down: ## Delete the local k3d cluster
 	k3d cluster delete hookline
+	@rm -f .hookline/target .hookline/k8s.env .hookline/seed.json
 
 cluster-reset: cluster-down cluster-up ## Recreate the cluster from scratch
 
 deploy-local: ## Build images, import them into k3d and install the Hookline chart
 	$(MAKE) images VERSION=local
 	k3d image import -c hookline $(addprefix hookline/,$(addsuffix :local,$(SERVICES)))
-	bash scripts/k8s-secrets.sh hookline
-	helm upgrade --install hookline deploy/helm/hookline -n hookline --create-namespace -f deploy/values/local.yaml --wait --timeout 5m
+	$(HELMFILE) -e local sync --selector name=hookline --skip-needs
 
-deploy-homeserver: ## Deploy to the home server cluster (current kube context)
-	helmfile -f deploy/helmfile.yaml -e homeserver apply
+deploy-homeserver: ## Deploy everything to the home server cluster (current kube context)
+	bash scripts/k8s-secrets.sh
+	$(HELMFILE) -e homeserver sync
 
 loadtest: ## Run the k6 steady-load test (K6_SCRIPT=loadtest/steady.js)
 	k6 run $${K6_SCRIPT:-loadtest/steady.js}

@@ -1,0 +1,31 @@
+redis:
+  image: redis:8.8.0-alpine
+  exporterImage: oliver006/redis_exporter:v1.82.0
+  # Secret with key "password" (scripts/k8s-secrets.sh creates it).
+  passwordSecret: redis-auth
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+postgres:
+  instances: 1
+  # CloudNativePG operand image (pinned).
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.6-system-trixie
+  storage: 10Gi
+  storageClass: ""
+  # kubernetes.io/basic-auth Secret with the hookline user's password.
+  credentialsSecret: hookline-pg-credentials
+  maxConnections: "200"
+  sharedBuffers: 256MB
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "2", memory: 1Gi }
+
+backup:
+  enabled: false
+  schedule: "0 3 * * *"
+  keepDays: 7
+  # Host folder on the node (k3d maps it to the Windows/WSL2 disk, see deploy/k3d/homeserver.yaml).
+  hostPath: /var/lib/hookline-backups
+
+selfSignedIssuer: true

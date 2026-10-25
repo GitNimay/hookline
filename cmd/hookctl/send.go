@@ -47,7 +47,9 @@ func send(ctx context.Context, args []string) error {
 	var sent, accepted, dup, failed atomic.Int64
 	var mu sync.Mutex
 	var lat []time.Duration
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: *workers}}
+	tr := localhostTransport()
+	tr.MaxIdleConnsPerHost = *workers
+	client := &http.Client{Timeout: 10 * time.Second, Transport: tr}
 	url := ingestURL() + "/v1/events"
 	if *batch > 1 {
 		url += ":batch"

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -101,7 +102,21 @@ func ingestURL() string {
 func chaosURL() string { return strings.TrimRight(env("CHAOS_URL", "http://localhost:9000"), "/") }
 func seedFile() string { return env("HOOKLINE_SEED_FILE", ".hookline/seed.json") }
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = &http.Client{Timeout: 30 * time.Second, Transport: localhostTransport()}
+
+// localhostTransport sends *.localhost (k3d Ingress hosts) to 127.0.0.1, which some
+// resolvers (Windows) do not do on their own.
+func localhostTransport() *http.Transport {
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if host, port, err := net.SplitHostPort(addr); err == nil && strings.HasSuffix(host, ".localhost") {
+			addr = net.JoinHostPort("127.0.0.1", port)
+		}
+		return d.DialContext(ctx, network, addr)
+	}
+	return t
+}
 
 // apiError is a non-2xx REST response.
 type apiError struct {

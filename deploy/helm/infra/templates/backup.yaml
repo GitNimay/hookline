@@ -1,0 +1,39 @@
+{{- if .Values.backup.enabled }}
+# Nightly logical backup to a host folder, keeping .Values.backup.keepDays days.
+# Restore: see docs/runbook.md#restore-a-backup
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hookline-pg-backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          containers:
+            - name: pg-dump
+              image: {{ .Values.postgres.imageName }}
+              env:
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: {{ .Values.postgres.credentialsSecret }}, key: password } }
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  f=/backups/hookline-$(date -u +%Y%m%dT%H%M%SZ).dump
+                  pg_dump -h hookline-pg-rw -U hookline -d hookline -Fc -f "$f.tmp"
+                  mv "$f.tmp" "$f"
+                  find /backups -name 'hookline-*.dump' -mtime +{{ .Values.backup.keepDays }} -delete
+                  ls -l /backups
+              volumeMounts: [{ name: backups, mountPath: /backups }]
+          volumes:
+            - name: backups
+              hostPath: { path: {{ .Values.backup.hostPath }}, type: DirectoryOrCreate }
+{{- end }}

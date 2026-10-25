@@ -1,0 +1,32 @@
+# Home server cluster (run inside WSL2). The load balancer binds 0.0.0.0:80/443 so LAN
+# clients reach the Ingress; backups land in /srv/hookline/backups on the WSL2 disk.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: hookline
+servers: 1
+agents: 1
+image: rancher/k3s:v1.36.3-k3s1
+kubeAPI:
+  host: "0.0.0.0"
+  hostPort: "6443"
+ports:
+  - port: 0.0.0.0:80:80
+    nodeFilters: [loadbalancer]
+  - port: 0.0.0.0:443:443
+    nodeFilters: [loadbalancer]
+volumes:
+  - volume: /srv/hookline/backups:/var/lib/hookline-backups
+    nodeFilters: [server:0, agent:*]
+  - volume: /srv/hookline/storage:/var/lib/rancher/k3s/storage
+    nodeFilters: [server:0, agent:*]
+options:
+  k3d:
+    wait: true
+    timeout: 300s
+  k3s:
+    extraArgs:
+      - arg: --tls-san=hookline.home
+        nodeFilters: [server:*]
+# k3d node containers use Docker's "unless-stopped" restart policy, so the cluster comes
+# back by itself once Docker starts after a reboot (docs/homeserver-setup.md).

@@ -1,0 +1,26 @@
+# One-instance CloudNativePG cluster; services connect to hookline-pg-rw.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: hookline-pg
+spec:
+  instances: {{ .Values.postgres.instances }}
+  imageName: {{ .Values.postgres.imageName }}
+  postgresql:
+    parameters:
+      max_connections: {{ .Values.postgres.maxConnections | quote }}
+      shared_buffers: {{ .Values.postgres.sharedBuffers | quote }}
+  bootstrap:
+    initdb:
+      database: hookline
+      owner: hookline
+      secret:
+        name: {{ .Values.postgres.credentialsSecret }}
+  storage:
+    size: {{ .Values.postgres.storage }}
+    {{- with .Values.postgres.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  resources: {{- toYaml .Values.postgres.resources | nindent 4 }}
+  monitoring:
+    enablePodMonitor: true

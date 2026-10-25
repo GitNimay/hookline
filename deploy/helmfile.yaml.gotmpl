@@ -1,0 +1,329 @@
+# Third-party charts plus the Hookline chart, in dependency order.
+#   helmfile -f deploy/helmfile.yaml.gotmpl -e local sync
+#   helmfile -f deploy/helmfile.yaml.gotmpl -e homeserver sync
+# Every chart version is pinned.
+
+environments:
+  local:
+    values:
+      - retention: 7d
+        retentionSize: 4GB
+        lokiRetention: 72h
+        tempoRetention: 48h
+        chaosMesh: true
+        backup: false
+        tailSampling: false
+        grafanaHost: grafana.localhost
+        alertWebhook: http://hookline-chaos-customer.hookline.svc.cluster.local:8080/alerts
+        hooklineValues: values/local.yaml
+  homeserver:
+    values:
+      - retention: 15d
+        retentionSize: 8GB
+        lokiRetention: 168h
+        tempoRetention: 72h
+        chaosMesh: false
+        backup: true
+        tailSampling: true
+        grafanaHost: grafana.home
+        # Set ALERT_WEBHOOK_URL (e.g. a Telegram relay) to route alerts; otherwise they stay in Alertmanager.
+        alertWebhook: {{ env "ALERT_WEBHOOK_URL" | quote }}
+        hooklineValues: values/homeserver.yaml
+---
+repositories:
+  - name: jetstack
+    url: https://charts.jetstack.io
+  - name: prometheus-community
+    url: https://prometheus-community.github.io/helm-charts
+  - name: grafana
+    url: https://grafana.github.io/helm-charts
+  - name: nats
+    url: https://nats-io.github.io/k8s/helm/charts/
+  - name: cnpg
+    url: https://cloudnative-pg.github.io/charts
+  - name: kedacore
+    url: https://kedacore.github.io/charts
+  - name: chaos-mesh
+    url: https://charts.chaos-mesh.org
+
+helmDefaults:
+  wait: true
+  timeout: 600
+  createNamespace: true
+
+releases:
+  - name: cert-manager
+    namespace: cert-manager
+    chart: jetstack/cert-manager
+    version: v1.21.3
+    values:
+      - crds: { enabled: true }
+        resources: { requests: { cpu: 10m, memory: 48Mi }, limits: { memory: 128Mi } }
+        webhook: { resources: { requests: { cpu: 10m, memory: 24Mi }, limits: { memory: 64Mi } } }
+        cainjector: { resources: { requests: { cpu: 10m, memory: 48Mi }, limits: { memory: 128Mi } } }
+
+  - name: kube-prometheus-stack
+    namespace: monitoring
+    chart: prometheus-community/kube-prometheus-stack
+    version: 92.13.1
+    values:
+      - kubeEtcd: { enabled: false }
+        kubeScheduler: { enabled: false }
+        kubeControllerManager: { enabled: false }
+        kubeProxy: { enabled: false }
+        defaultRules:
+          rules: { etcd: false, kubeSchedulerAlerting: false, kubeSchedulerRecording: false, kubeControllerManager: false, kubeProxy: false }
+        prometheus:
+          prometheusSpec:
+            retention: {{ .Values.retention }}
+            retentionSize: {{ .Values.retentionSize }}
+            scrapeInterval: 15s
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { memory: 1536Mi } }
+            storageSpec:
+              volumeClaimTemplate:
+                spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 10Gi } } }
+        alertmanager:
+          alertmanagerSpec:
+            resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+          config:
+            route:
+              receiver: {{ if .Values.alertWebhook }}hookline-webhook{{ else }}"null"{{ end }}
+              group_by: [alertname]
+              group_wait: 10s
+              routes:
+                - { receiver: "null", matchers: ['alertname = "Watchdog"'] }
+            receivers:
+              - name: "null"
+              {{- if .Values.alertWebhook }}
+              - name: hookline-webhook
+                webhook_configs:
+                  - url: {{ .Values.alertWebhook }}
+                    send_resolved: true
+              {{- end }}
+        grafana:
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 384Mi } }
+          ingress:
+            enabled: true
+            ingressClassName: traefik
+            hosts: [{{ .Values.grafanaHost }}]
+          grafana.ini:
+            auth.anonymous: { enabled: true, org_role: Viewer }
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+              searchNamespace: ALL
+              folderAnnotation: grafana_folder
+              provider: { foldersFromFilesStructure: true }
+          additionalDataSources:
+            - name: Loki
+              uid: loki
+              type: loki
+              url: http://loki.monitoring.svc.cluster.local:3100
+              jsonData:
+                derivedFields:
+                  - { name: trace_id, matcherRegex: '"trace_id":"(\w+)"', datasourceUid: tempo, url: "$${__value.raw}" }
+            - name: Tempo
+              uid: tempo
+              type: tempo
+              url: http://tempo.monitoring.svc.cluster.local:3200
+              jsonData:
+                tracesToLogsV2: { datasourceUid: loki, filterByTraceID: false, customQuery: true, query: '{namespace="hookline"} |= "$${__trace.traceId}"' }
+        prometheus-node-exporter:
+          resources: { requests: { cpu: 10m, memory: 24Mi }, limits: { memory: 64Mi } }
+        kube-state-metrics:
+          resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+
+  - name: loki
+    namespace: monitoring
+    chart: grafana/loki
+    version: 7.5.0
+    needs: [monitoring/kube-prometheus-stack]
+    values:
+      - deploymentMode: SingleBinary
+        loki:
+          auth_enabled: false
+          commonConfig: { replication_factor: 1 }
+          storage: { type: filesystem }
+          schemaConfig:
+            configs:
+              - { from: "2024-01-01", store: tsdb, object_store: filesystem, schema: v13, index: { prefix: index_, period: 24h } }
+          limits_config: { retention_period: {{ .Values.lokiRetention }} }
+          compactor: { retention_enabled: true, delete_request_store: filesystem }
+        singleBinary:
+          replicas: 1
+          persistence: { size: 5Gi }
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 512Mi } }
+        backend: { replicas: 0 }
+        read: { replicas: 0 }
+        write: { replicas: 0 }
+        chunksCache: { enabled: false }
+        resultsCache: { enabled: false }
+        gateway: { enabled: false }
+        lokiCanary: { enabled: false }
+        test: { enabled: false }
+
+  - name: tempo
+    namespace: monitoring
+    chart: grafana/tempo
+    version: 1.24.4
+    values:
+      - tempo:
+          retention: {{ .Values.tempoRetention }}
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 512Mi } }
+          receivers:
+            otlp:
+              protocols:
+                grpc: { endpoint: "0.0.0.0:4317" }
+        persistence: { enabled: true, size: 5Gi }
+
+  - name: alloy
+    namespace: monitoring
+    chart: grafana/alloy
+    version: 1.14.3
+    needs: [monitoring/loki, monitoring/tempo]
+    values:
+      - controller: { type: deployment, replicas: 1 }
+        alloy:
+          resources: { requests: { cpu: 50m, memory: 96Mi }, limits: { memory: 384Mi } }
+          extraPorts:
+            - { name: otlp-grpc, port: 4317, targetPort: 4317, protocol: TCP }
+          configMap:
+            content: |
+              // Pod logs -> Loki, with the Hookline component as "service".
+              discovery.kubernetes "pods" {
+                role = "pod"
+              }
+              discovery.relabel "pods" {
+                targets = discovery.kubernetes.pods.targets
+                rule {
+                  source_labels = ["__meta_kubernetes_namespace"]
+                  target_label  = "namespace"
+                }
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_name"]
+                  target_label  = "pod"
+                }
+                rule {
+                  source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_component"]
+                  target_label  = "service"
+                }
+              }
+              loki.source.kubernetes "pods" {
+                targets    = discovery.relabel.pods.output
+                forward_to = [loki.write.default.receiver]
+              }
+              loki.write "default" {
+                endpoint {
+                  url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+                }
+              }
+              // OTLP traces -> Tempo.
+              otelcol.receiver.otlp "default" {
+                grpc {
+                  endpoint = "0.0.0.0:4317"
+                }
+                output {
+                  traces = [{{ if .Values.tailSampling }}otelcol.processor.tail_sampling.default.input{{ else }}otelcol.exporter.otlp.tempo.input{{ end }}]
+                }
+              }
+              {{- if .Values.tailSampling }}
+              // Keep every trace with an error, plus 10% of the rest.
+              otelcol.processor.tail_sampling "default" {
+                decision_wait = "10s"
+                policy {
+                  name = "errors"
+                  type = "status_code"
+                  status_code {
+                    status_codes = ["ERROR"]
+                  }
+                }
+                policy {
+                  name = "sample"
+                  type = "probabilistic"
+                  probabilistic {
+                    sampling_percentage = 10
+                  }
+                }
+                output {
+                  traces = [otelcol.exporter.otlp.tempo.input]
+                }
+              }
+              {{- end }}
+              otelcol.exporter.otlp "tempo" {
+                client {
+                  endpoint = "tempo.monitoring.svc.cluster.local:4317"
+                  tls {
+                    insecure = true
+                  }
+                }
+              }
+
+  - name: nats
+    namespace: infra
+    chart: nats/nats
+    version: 2.15.1
+    needs: [monitoring/kube-prometheus-stack]
+    values:
+      - config:
+          jetstream:
+            enabled: true
+            fileStore: { pvc: { size: 5Gi } }
+          monitor: { enabled: true }
+        service:
+          ports:
+            monitor: { enabled: true }
+        container:
+          merge:
+            resources: { requests: { cpu: 100m, memory: 128Mi }, limits: { memory: 512Mi } }
+        promExporter:
+          enabled: true
+          podMonitor: { enabled: true }
+        natsBox: { enabled: false }
+
+  - name: cloudnative-pg
+    namespace: cnpg-system
+    chart: cnpg/cloudnative-pg
+    version: 0.29.1
+    values:
+      - resources: { requests: { cpu: 50m, memory: 96Mi }, limits: { memory: 256Mi } }
+
+  - name: keda
+    namespace: keda
+    chart: kedacore/keda
+    version: 2.21.0
+    values:
+      - resources:
+          operator: { requests: { cpu: 50m, memory: 96Mi }, limits: { memory: 256Mi } }
+          metricServer: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }
+          webhooks: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+
+  {{- if .Values.chaosMesh }}
+  - name: chaos-mesh
+    namespace: chaos-mesh
+    chart: chaos-mesh/chaos-mesh
+    version: 2.8.6
+    values:
+      - chaosDaemon:
+          runtime: containerd
+          socketPath: /run/k3s/containerd/containerd.sock
+        dashboard: { create: false }
+        dnsServer: { create: false }
+  {{- end }}
+
+  - name: infra
+    namespace: infra
+    chart: ./helm/infra
+    needs: [cert-manager/cert-manager, cnpg-system/cloudnative-pg, monitoring/kube-prometheus-stack, infra/nats]
+    values:
+      - backup: { enabled: {{ .Values.backup }} }
+
+  - name: hookline
+    namespace: hookline
+    chart: ./helm/hookline
+    needs: [infra/infra, keda/keda, monitoring/alloy]
+    values:
+      - {{ .Values.hooklineValues }}

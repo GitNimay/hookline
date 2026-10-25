@@ -1,0 +1,108 @@
+# Hookline chart defaults. Environment differences live in deploy/values/*.yaml.
+
+image:
+  # Image for a service is <prefix><service>:<tag>, e.g. hookline/worker:local
+  prefix: hookline/
+  tag: local
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Secret (not rendered by this chart) with DATABASE_URL, HOOKLINE_MASTER_KEY,
+# HOOKLINE_ADMIN_KEY and REDIS_PASSWORD. scripts/k8s-secrets.sh creates it.
+existingSecret: hookline-secrets
+
+# Shared environment for every service (ConfigMap). See .env.example for all variables.
+config:
+  LOG_LEVEL: info
+  LOG_FORMAT: json
+  NATS_URL: nats://nats.infra.svc.cluster.local:4222
+  REDIS_ADDR: redis.infra.svc.cluster.local:6379
+  CONTROL_GRPC_ADDR: hookline-control:9090
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy.monitoring.svc.cluster.local:4317
+  OTEL_TRACES_SAMPLER_RATIO: "1"
+  RETRY_SCHEDULE: default
+  SSRF_ALLOWLIST: ""
+  DRAIN_DELAY: 5s
+  SHUTDOWN_TIMEOUT: 20s
+
+ingress:
+  enabled: true
+  className: traefik
+  host: hookline.localhost
+  chaosHost: chaos.localhost
+  tls:
+    enabled: false
+    clusterIssuer: selfsigned
+    secretName: hookline-tls
+
+# Namespaces of dependencies, used by NetworkPolicies and KEDA.
+infraNamespace: infra
+monitoringNamespace: monitoring
+prometheusURL: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+natsMonitoringEndpoint: nats.infra.svc.cluster.local:8222
+
+metrics:
+  serviceMonitor: true
+  prometheusRule: true
+  dashboards: true
+
+networkPolicy:
+  enabled: true
+
+migration:
+  enabled: true
+
+# Applied to every service unless the service overrides it. Memory must be in Mi:
+# GOMEMLIMIT is set to 90% of the limit.
+defaults:
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+services:
+  ingest:
+    enabled: true
+    replicas: 2
+    http: true
+    grpc: true
+    secret: true
+    hpa: { enabled: true, minReplicas: 2, maxReplicas: 6, cpu: 70 }
+  control:
+    enabled: true
+    replicas: 1
+    http: true
+    grpc: true
+    secret: true
+  dispatcher:
+    enabled: true
+    replicas: 1
+    secret: true
+    keda:
+      enabled: true
+      type: nats-jetstream
+      minReplicas: 1
+      maxReplicas: 6
+      lagThreshold: "100"
+  worker:
+    enabled: true
+    replicas: 1
+    secret: true
+    env:
+      WORKER_CONCURRENCY: "100"
+      DB_MAX_CONNS: "30"
+    keda:
+      enabled: true
+      type: prometheus
+      minReplicas: 1
+      maxReplicas: 20
+      # Scale on total pending delivery jobs across all tenant consumers.
+      query: sum(jetstream_consumer_num_pending{stream_name="DELIVERIES"})
+      threshold: "500"
+  scheduler:
+    enabled: true
+    replicas: 1
+    secret: true
+  chaos-customer:
+    enabled: false
+    replicas: 1
+    http: true

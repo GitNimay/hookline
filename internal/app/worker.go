@@ -196,7 +196,7 @@ func sortedKeys(m map[string]jetstream.Consumer) []string {
 func (w *Worker) Handle(ctx context.Context, msg jetstream.Msg) {
 	telemetry.WorkerInflight.Inc()
 	defer telemetry.WorkerInflight.Dec()
-	ctx = telemetry.Extract(ctx, http.Header(msg.Headers()))
+	ctx = telemetry.Extract(ctx, msg.Headers())
 	ctx, span := telemetry.Tracer.Start(ctx, "deliver")
 	defer span.End()
 
@@ -320,12 +320,13 @@ func (w *Worker) handle(ctx context.Context, job *pb.DeliveryJob, log *slog.Logg
 	telemetry.AttemptDuration.WithLabelValues(outcomeLabel(outcome)).Observe(res.Duration.Seconds())
 	switch next.Status {
 	case domain.StatusSucceeded:
+		log.DebugContext(ctx, "delivered", "status_code", res.StatusCode, "duration_ms", res.Duration.Milliseconds())
 		telemetry.EndToEnd.WithLabelValues(job.TenantId).Observe(time.Since(d.EventCreatedAt).Seconds())
 	case domain.StatusDead:
 		telemetry.DeliveriesDead.WithLabelValues(job.TenantId, next.DeadReason).Inc()
 		log.WarnContext(ctx, "delivery dead", "reason", next.DeadReason, "status_code", res.StatusCode, "error_kind", kind)
 	case domain.StatusRetrying:
-		log.DebugContext(ctx, "delivery will retry", "in", next.Delay, "status_code", res.StatusCode, "error_kind", kind)
+		log.WarnContext(ctx, "delivery will retry", "in", next.Delay, "status_code", res.StatusCode, "error_kind", kind)
 	}
 	if w.Breaker != nil && outcome != delivery.Permanent {
 		tr, err := w.Breaker.Record(ctx, job.EndpointId, time.Now(), outcome == delivery.Success, dec.NeedProbe)

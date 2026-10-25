@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -119,7 +118,7 @@ func Msg(ctx context.Context, subject string, m proto.Message) (*nats.Msg, error
 	}
 	msg := nats.NewMsg(subject)
 	msg.Data = data
-	telemetry.Inject(ctx, http.Header(msg.Header))
+	telemetry.Inject(ctx, msg.Header)
 	return msg, nil
 }
 

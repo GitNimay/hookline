@@ -1,0 +1,51 @@
+# Stage 2: Windows home server (k3d in WSL2). Sized for a 16 GB / 8-thread machine
+# with about 10 GB given to WSL2; see docs/homeserver-setup.md.
+image:
+  prefix: ghcr.io/gitnimay/hookline-
+  tag: v0.1.0 # never "latest"
+  pullPolicy: IfNotPresent
+  pullSecrets:
+    - name: ghcr-pull
+
+config:
+  LOG_LEVEL: info
+  RETRY_SCHEDULE: default
+  OTEL_TRACES_SAMPLER_RATIO: "0.1"
+  SSRF_ALLOWLIST: ""
+
+ingress:
+  host: hookline.home
+  tls:
+    enabled: true
+    clusterIssuer: selfsigned
+    secretName: hookline-tls
+
+services:
+  ingest:
+    enabled: true
+    http: true
+    grpc: true
+    secret: true
+    hpa: { enabled: true, minReplicas: 2, maxReplicas: 4, cpu: 70 }
+  dispatcher:
+    enabled: true
+    secret: true
+    keda: { enabled: true, type: nats-jetstream, minReplicas: 1, maxReplicas: 3, lagThreshold: "100" }
+  worker:
+    enabled: true
+    secret: true
+    env:
+      WORKER_CONCURRENCY: "100"
+      DB_MAX_CONNS: "30"
+    resources:
+      requests: { cpu: 100m, memory: 96Mi }
+      limits: { cpu: "1", memory: 256Mi }
+    keda:
+      enabled: true
+      type: prometheus
+      minReplicas: 1
+      maxReplicas: 8
+      query: sum(jetstream_consumer_num_pending{stream_name="DELIVERIES"})
+      threshold: "500"
+  chaos-customer:
+    enabled: false

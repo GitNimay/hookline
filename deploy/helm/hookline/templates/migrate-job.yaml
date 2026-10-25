@@ -1,0 +1,39 @@
+{{- if .Values.migration.enabled }}
+{{- $ctx := dict "root" $ "name" "migrate" }}
+# Runs goose migrations before every install and upgrade; services never migrate on start-up.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hookline-migrate
+  labels: {{- include "hookline.labels" $ctx | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: {{- include "hookline.labels" $ctx | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext: {{- include "hookline.podSecurityContext" $ | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "hookline.image" (dict "root" $ "name" "hookctl") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [migrate, up]
+          securityContext: {{- include "hookline.containerSecurityContext" $ | nindent 12 }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.existingSecret }}, key: DATABASE_URL }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 128Mi }
+{{- end }}

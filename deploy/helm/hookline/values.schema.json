@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "existingSecret", "config", "services", "defaults"],
+  "definitions": {
+    "resources": {
+      "type": "object",
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": { "type": "object", "required": ["cpu", "memory"] },
+        "limits": {
+          "type": "object",
+          "required": ["cpu", "memory"],
+          "properties": { "memory": { "type": "string", "pattern": "^[0-9]+Mi$" } }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 0 },
+        "http": { "type": "boolean" },
+        "grpc": { "type": "boolean" },
+        "secret": { "type": "boolean" },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "resources": { "$ref": "#/definitions/resources" },
+        "hpa": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicas": { "type": "integer", "minimum": 1 },
+            "maxReplicas": { "type": "integer", "minimum": 1 },
+            "cpu": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        },
+        "keda": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": { "enum": ["nats-jetstream", "prometheus"] },
+            "minReplicas": { "type": "integer", "minimum": 0 },
+            "maxReplicas": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["prefix", "tag"],
+      "properties": {
+        "prefix": { "type": "string" },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "existingSecret": { "type": "string", "minLength": 1 },
+    "config": {
+      "type": "object",
+      "required": ["NATS_URL", "REDIS_ADDR", "RETRY_SCHEDULE"],
+      "additionalProperties": { "type": "string" }
+    },
+    "defaults": {
+      "type": "object",
+      "required": ["resources"],
+      "properties": { "resources": { "$ref": "#/definitions/resources" } }
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/service" }
+    }
+  }
+}
