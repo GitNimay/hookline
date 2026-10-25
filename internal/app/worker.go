@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -75,7 +74,7 @@ func NewWorker(w Worker) *Worker {
 	return &w
 }
 
-// perTenantFetch is how many jobs one tenant may take per round-robin turn.
+// perTenantFetch is how many jobs one tenant's puller holds at most before they start.
 const perTenantFetch = 10
 
 // Run fetches jobs round-robin across tenant consumers until ctx ends, then waits for in-flight jobs.
@@ -90,86 +89,83 @@ func (w *Worker) Run(ctx context.Context) error {
 		defer stopFlush()
 	}
 	sem := make(chan struct{}, w.Concurrency)
-	var wg sync.WaitGroup
-	defer wg.Wait()
+	var jobs sync.WaitGroup // in-flight jobs
+	defer jobs.Wait()
 
-	consumers := map[string]jetstream.Consumer{}
-	var names []string
-	var refreshed time.Time
-	start := 0
-	for ctx.Err() == nil {
-		if time.Since(refreshed) > w.RefreshEvery {
-			names = w.refreshConsumers(ctx, consumers)
-			refreshed = time.Now()
+	// One puller per tenant consumer. Pullers fetch without holding slots, then each job
+	// waits for a slot. Blocked channel senders are served FIFO, so with one waiting job per
+	// tenant at a time the pool is shared round-robin, and idle tenants hold nothing.
+	var pullers sync.WaitGroup
+	defer pullers.Wait()
+	running := map[string]context.CancelFunc{}
+	defer func() {
+		for _, stop := range running {
+			stop()
 		}
-		got := 0
-		// Rotate the starting tenant each round so no tenant is always first.
-		for i := range names {
-			name := names[(start+i)%len(names)]
-			slots := acquire(ctx, sem, perTenantFetch)
-			if slots == 0 {
-				return nil
-			}
-			batch, err := consumers[name].FetchNoWait(slots)
-			if err != nil {
-				release(sem, slots)
-				if errors.Is(err, jetstream.ErrConsumerNotFound) {
-					refreshed = time.Time{}
-				}
+	}()
+	consumers := map[string]jetstream.Consumer{}
+	for {
+		w.refreshConsumers(ctx, consumers)
+		for name, c := range consumers {
+			if _, ok := running[name]; ok {
 				continue
 			}
-			for msg := range batch.Messages() {
-				slots--
-				got++
-				wg.Add(1)
-				go func() {
-					defer func() { <-sem; wg.Done() }()
-					// In-flight jobs finish during shutdown; their own timeouts bound them.
-					w.Handle(context.WithoutCancel(ctx), msg)
-				}()
-			}
-			release(sem, slots)
+			pctx, stop := context.WithCancel(ctx)
+			running[name] = stop
+			pullers.Add(1)
+			go func() {
+				defer pullers.Done()
+				w.pull(pctx, ctx, c, sem, &jobs)
+			}()
 		}
-		start++
-		if got == 0 && !sleep(ctx, 50*time.Millisecond) {
+		for name, stop := range running {
+			if _, ok := consumers[name]; !ok {
+				stop()
+				delete(running, name)
+			}
+		}
+		if !sleep(ctx, w.RefreshEvery) {
 			return nil
 		}
 	}
-	return nil
 }
 
-// acquire takes between 1 and max slots, blocking only for the first. 0 means ctx ended.
-func acquire(ctx context.Context, sem chan struct{}, max int) int {
-	select {
-	case sem <- struct{}{}:
-	case <-ctx.Done():
-		return 0
-	}
-	n := 1
-	for n < max {
-		select {
-		case sem <- struct{}{}:
-			n++
-		default:
-			return n
+// pull fetches one tenant's jobs and starts each as a slot frees up, until pctx ends.
+// Jobs run detached from cancellation (their own timeouts bound them) so shutdown never
+// abandons a started delivery; fetched jobs that never started are naked for redelivery.
+func (w *Worker) pull(pctx, runCtx context.Context, c jetstream.Consumer, sem chan struct{}, jobs *sync.WaitGroup) {
+	for pctx.Err() == nil {
+		batch, err := c.Fetch(perTenantFetch, jetstream.FetchMaxWait(2*time.Second))
+		if err != nil {
+			// A deleted consumer is stopped by the next refresh; until then just back off.
+			if !sleep(pctx, time.Second) {
+				return
+			}
+			continue
+		}
+		for msg := range batch.Messages() {
+			select {
+			case sem <- struct{}{}:
+			case <-pctx.Done():
+				_ = msg.Nak()
+				continue
+			}
+			jobs.Add(1)
+			go func() {
+				defer func() { <-sem; jobs.Done() }()
+				w.Handle(context.WithoutCancel(runCtx), msg)
+			}()
 		}
 	}
-	return n
 }
 
-func release(sem chan struct{}, n int) {
-	for range n {
-		<-sem
-	}
-}
-
-func (w *Worker) refreshConsumers(ctx context.Context, have map[string]jetstream.Consumer) []string {
+func (w *Worker) refreshConsumers(ctx context.Context, have map[string]jetstream.Consumer) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	stream, err := w.Queue.JS.Stream(cctx, queue.DeliveriesStream)
 	if err != nil {
 		w.Log.Warn("list consumers", "err", err)
-		return sortedKeys(have)
+		return
 	}
 	seen := map[string]bool{}
 	lister := stream.ConsumerNames(cctx)
@@ -187,23 +183,13 @@ func (w *Worker) refreshConsumers(ctx context.Context, have map[string]jetstream
 	}
 	if lister.Err() != nil {
 		w.Log.Warn("list consumers", "err", lister.Err())
-		return sortedKeys(have)
+		return
 	}
 	for name := range have {
 		if !seen[name] {
 			delete(have, name)
 		}
 	}
-	return sortedKeys(have)
-}
-
-func sortedKeys(m map[string]jetstream.Consumer) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // Handle processes one delivery job. It acks only after the outcome is committed.
