@@ -159,7 +159,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, evs []eventMsg) error {
 			continue // already in progress or replayed; those paths publish their own jobs
 		}
 		tenant, dj, id := jobFor(ref(r), "d")
-		m, err := queue.Msg(byEvent[r.EventID].ctx, domain.DeliveriesSubject(tenant), dj)
+		m, err := queue.Msg(byEvent[r.EventID].ctx, domain.DeliveriesSubject(tenant), dj) //nolint:contextcheck // carries this event's own trace
 		if err != nil {
 			return err
 		}
