@@ -49,6 +49,25 @@ type Worker struct {
 	LockFor time.Duration
 
 	endpoints *ttlCache[uuid.UUID, workerEndpoint]
+	claims    *batcher[store.ClaimDeliveryWithEventParams, claimResult]
+	records   *batcher[store.RecordAttemptParams, recordResult]
+}
+
+// Claims and attempt records from concurrent jobs share statements: up to dbBatch jobs per
+// statement, with at most dbFlushes statements of each kind in flight per worker.
+const (
+	dbBatch   = 100
+	dbFlushes = 3
+)
+
+type claimResult struct {
+	row store.ClaimDeliveryWithEventRow
+	ok  bool // false: not claimable (stale, duplicate or locked)
+}
+
+type recordResult struct {
+	done bool // false: completed elsewhere meanwhile
+	err  error
 }
 
 type workerEndpoint struct {
@@ -59,9 +78,11 @@ type workerEndpoint struct {
 
 // NewWorker builds a worker.
 func NewWorker(w Worker) *Worker {
+	wp := &w
 	w.endpoints = newCache[uuid.UUID, workerEndpoint](5 * time.Second)
+	w.claims = newBatcher(dbBatch, dbFlushes, wp.claimBatch)
+	w.records = newBatcher(dbBatch, dbFlushes, wp.recordBatch)
 	if w.Breaker != nil {
-		wp := &w
 		w.Breaker.OnTransition = func(ep, to string) { wp.breakerChanged(ep, to, false) }
 		w.Breaker.OnError = func(err error) { wp.Log.Warn("breaker flush failed, failing open", "err", err) }
 	}
@@ -71,7 +92,7 @@ func NewWorker(w Worker) *Worker {
 	if w.RefreshEvery == 0 {
 		w.RefreshEvery = 10 * time.Second
 	}
-	return &w
+	return wp
 }
 
 // perTenantFetch is how many jobs one tenant's puller holds at most before they start.
@@ -290,13 +311,14 @@ func (w *Worker) handle(ctx context.Context, job *pb.DeliveryJob, log *slog.Logg
 		}
 	}
 
-	d, err := q.ClaimDeliveryWithEvent(dbctx, store.ClaimDeliveryWithEventParams{ID: ids.delivery, TenantID: ids.tenant, AttemptCount: expected, LockSecs: w.LockFor.Seconds()})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return w.notClaimed(dbctx, q, ids, expected)
-	}
+	c, err := w.claims.do(dbctx, store.ClaimDeliveryWithEventParams{ID: ids.delivery, TenantID: ids.tenant, AttemptCount: expected, LockSecs: w.LockFor.Seconds()})
 	if err != nil {
 		return action{}, err
 	}
+	if !c.ok {
+		return w.notClaimed(dbctx, q, ids, expected)
+	}
+	d := c.row
 	if job.ScheduledUnixMs > 0 {
 		telemetry.ScheduleLag.Observe(max(0, time.Since(time.UnixMilli(job.ScheduledUnixMs)).Seconds()))
 	}
@@ -409,15 +431,18 @@ func (w *Worker) record(ctx context.Context, ids jobIDs, ep workerEndpoint, atte
 	} else if kind == domain.KindHTTPStatus {
 		errMsg = http.StatusText(res.StatusCode)
 	}
-	q := store.New(w.Pool)
-	n, err := q.RecordAttempt(ctx, store.RecordAttemptParams{
+	r, err := w.records.do(ctx, store.RecordAttemptParams{
 		DeliveryID: ids.delivery, AttemptCount: attemptCount, Status: next.Status, NextAttemptAt: nextAt, DeadReason: next.DeadReason,
 		AttemptID: domain.NewID(), StartedAt: time.Now().Add(-res.Duration), DurationMs: int32(res.Duration.Milliseconds()),
 		StatusCode: int32(res.StatusCode), ErrorKind: kind, ErrorMessage: errMsg, ResponseBodySnippet: res.Body,
 	})
-	if err != nil || n == 0 {
-		return err // n == 0: completed elsewhere meanwhile; keep the first result
+	if err == nil {
+		err = r.err
 	}
+	if err != nil || !r.done {
+		return err // not done: completed elsewhere meanwhile; keep the first result
+	}
+	q := store.New(w.Pool)
 	switch {
 	case next.DeadReason == domain.ReasonEndpointGone:
 		_, err = q.SetEndpointStatus(ctx, store.SetEndpointStatusParams{ID: ids.endpoint, TenantID: ids.tenant, Status: "disabled", DisabledReason: "gone"})
@@ -433,6 +458,94 @@ func (w *Worker) record(ctx context.Context, ids jobIDs, ep workerEndpoint, atte
 		w.Log.WarnContext(ctx, "update endpoint health", "endpoint_id", domain.FormatID(domain.PrefixEndpoint, ids.endpoint), "err", err)
 	}
 	return nil
+}
+
+// claimBatch claims a batch of deliveries with one statement (a single job uses the
+// single-row query). A delivery that appears twice in a batch is claimed for one job only.
+func (w *Worker) claimBatch(ctx context.Context, reqs []store.ClaimDeliveryWithEventParams) ([]claimResult, error) {
+	telemetry.WorkerDBBatch.WithLabelValues("claim").Observe(float64(len(reqs)))
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	q := store.New(w.Pool)
+	out := make([]claimResult, len(reqs))
+	if len(reqs) == 1 {
+		row, err := q.ClaimDeliveryWithEvent(ctx, reqs[0])
+		if errors.Is(err, pgx.ErrNoRows) {
+			return out, nil
+		}
+		out[0] = claimResult{row: row, ok: err == nil}
+		return out, err
+	}
+	p := store.ClaimDeliveriesWithEventsParams{LockSecs: reqs[0].LockSecs}
+	for _, r := range reqs {
+		p.Ids, p.TenantIds, p.AttemptCounts = append(p.Ids, r.ID), append(p.TenantIds, r.TenantID), append(p.AttemptCounts, r.AttemptCount)
+	}
+	rows, err := q.ClaimDeliveriesWithEvents(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	claimed := make(map[uuid.UUID]store.ClaimDeliveriesWithEventsRow, len(rows))
+	for _, r := range rows {
+		claimed[r.ID] = r
+	}
+	for i, r := range reqs {
+		if c, ok := claimed[r.ID]; ok && c.AttemptCount == r.AttemptCount {
+			out[i] = claimResult{row: store.ClaimDeliveryWithEventRow(c), ok: true}
+			delete(claimed, r.ID)
+		}
+	}
+	return out, nil
+}
+
+// recordBatch records a batch of attempts with one statement. If the batch fails, each
+// attempt is recorded on its own, so one bad row cannot fail the others.
+func (w *Worker) recordBatch(ctx context.Context, reqs []store.RecordAttemptParams) ([]recordResult, error) {
+	telemetry.WorkerDBBatch.WithLabelValues("record").Observe(float64(len(reqs)))
+	out := make([]recordResult, len(reqs))
+	if len(reqs) > 1 {
+		done, err := w.recordAll(ctx, reqs)
+		if err == nil {
+			for i, r := range reqs {
+				out[i].done = done[r.DeliveryID]
+				delete(done, r.DeliveryID)
+			}
+			return out, nil
+		}
+		w.Log.WarnContext(ctx, "batched attempt record failed; recording one by one", "jobs", len(reqs), "err", err)
+	}
+	for i, r := range reqs {
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		n, err := store.New(w.Pool).RecordAttempt(rctx, r)
+		cancel()
+		out[i] = recordResult{done: n > 0, err: err}
+	}
+	return out, nil
+}
+
+func (w *Worker) recordAll(ctx context.Context, reqs []store.RecordAttemptParams) (map[uuid.UUID]bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var p store.RecordAttemptsParams
+	for _, r := range reqs {
+		next := ""
+		if r.NextAttemptAt != nil {
+			next = r.NextAttemptAt.Format(time.RFC3339Nano)
+		}
+		p.DeliveryIds, p.AttemptCounts, p.Statuses = append(p.DeliveryIds, r.DeliveryID), append(p.AttemptCounts, r.AttemptCount), append(p.Statuses, r.Status)
+		p.NextAttemptAts, p.DeadReasons, p.AttemptIds = append(p.NextAttemptAts, next), append(p.DeadReasons, r.DeadReason), append(p.AttemptIds, r.AttemptID)
+		p.StartedAts, p.DurationsMs, p.StatusCodes = append(p.StartedAts, r.StartedAt), append(p.DurationsMs, r.DurationMs), append(p.StatusCodes, r.StatusCode)
+		p.ErrorKinds, p.ErrorMessages = append(p.ErrorKinds, r.ErrorKind), append(p.ErrorMessages, r.ErrorMessage)
+		p.ResponseBodySnippets = append(p.ResponseBodySnippets, r.ResponseBodySnippet)
+	}
+	ids, err := store.New(w.Pool).RecordAttempts(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	done := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		done[id] = true
+	}
+	return done, nil
 }
 
 func truncate(s string, n int) string {

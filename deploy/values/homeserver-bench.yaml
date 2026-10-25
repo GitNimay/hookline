@@ -1,0 +1,14 @@
+# Opt-in overlay for load tests, e2e and chaos runs on the home server: adds the in-cluster
+# chaos customer as a webhook receiver. Apply on top of homeserver.yaml:
+#   helm upgrade hookline deploy/helm/hookline -n hookline \
+#     -f deploy/values/homeserver.yaml -f deploy/values/homeserver-bench.yaml
+# Remove it again with `make deploy-homeserver`.
+config:
+  SSRF_ALLOWLIST: hookline-chaos-customer
+
+ingress:
+  chaosHost: chaos.home
+
+services:
+  chaos-customer:
+    enabled: true

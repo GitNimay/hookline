@@ -56,6 +56,10 @@ var (
 	WorkerInflight = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "hookline_worker_inflight", Help: "Delivery jobs in progress.",
 	})
+	WorkerDBBatch = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "hookline_worker_db_batch_size", Help: "Delivery jobs per worker database statement.",
+		Buckets: []float64{1, 2, 5, 10, 20, 50, 100},
+	}, []string{"op"})
 	SchedulerDuePublished = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "hookline_scheduler_due_published_total", Help: "Retry jobs published by the scheduler.",
 	})
