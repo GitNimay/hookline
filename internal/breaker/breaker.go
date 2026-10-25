@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -130,11 +131,76 @@ func (s *State) shouldOpen(now time.Time) bool {
 	return total >= MinWindowAttempts && float64(fail)/float64(total) > FailRateToOpen
 }
 
-// Breaker stores states in Redis.
-type Breaker struct{ rdb *redis.Client }
+// Breaker stores states in Redis. Results of ordinary attempts are buffered per pod and
+// written once per endpoint per flush (FlushLoop), so a busy endpoint does not make every
+// attempt contend on one Redis key. Probe results are written immediately with Record.
+type Breaker struct {
+	rdb *redis.Client
+
+	// OnTransition, if set, is called for state changes found while flushing.
+	OnTransition func(ep, to string)
+	// OnError, if set, is called when a flush fails; those results are dropped (fail open).
+	OnError func(error)
+
+	mu      sync.Mutex
+	pending map[string][]Result
+}
+
+// Result is one attempt outcome.
+type Result struct {
+	At      time.Time
+	Success bool
+	Probe   bool
+}
 
 // New returns a Redis-backed breaker.
-func New(rdb *redis.Client) *Breaker { return &Breaker{rdb: rdb} }
+func New(rdb *redis.Client) *Breaker { return &Breaker{rdb: rdb, pending: map[string][]Result{}} }
+
+// Reset forgets an endpoint's state and any held probe.
+func (b *Breaker) Reset(ctx context.Context, ep string) error {
+	return b.rdb.Del(ctx, key(ep), probeKey(ep)).Err()
+}
+
+// Observe buffers a non-probe result for the next flush.
+func (b *Breaker) Observe(ep string, at time.Time, success bool) {
+	b.mu.Lock()
+	b.pending[ep] = append(b.pending[ep], Result{At: at, Success: success})
+	b.mu.Unlock()
+}
+
+// FlushLoop writes buffered results every 100 ms until ctx ends, then once more.
+func (b *Breaker) FlushLoop(ctx context.Context) error {
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			b.Flush(fctx)
+			cancel()
+			return nil
+		case <-t.C:
+			b.Flush(ctx)
+		}
+	}
+}
+
+// Flush writes every buffered result, one transaction per endpoint.
+func (b *Breaker) Flush(ctx context.Context) {
+	b.mu.Lock()
+	batch := b.pending
+	b.pending = make(map[string][]Result, len(batch))
+	b.mu.Unlock()
+	for ep, rs := range batch {
+		tr, err := b.apply(ctx, ep, rs)
+		if err != nil && b.OnError != nil {
+			b.OnError(err)
+		}
+		if tr != "" && b.OnTransition != nil {
+			b.OnTransition(ep, tr)
+		}
+	}
+}
 
 func key(ep string) string      { return "hookline:breaker:" + ep }
 func probeKey(ep string) string { return "hookline:breaker:probe:" + ep }
@@ -179,15 +245,27 @@ func (b *Breaker) ReleaseProbe(ctx context.Context, ep string) error {
 	return b.rdb.Del(ctx, probeKey(ep)).Err()
 }
 
-// Record stores a result atomically (optimistic WATCH transaction) and returns the transition, if any.
+// Record stores one result now (used for probes) and returns the transition, if any.
 func (b *Breaker) Record(ctx context.Context, ep string, now time.Time, success, probe bool) (string, error) {
+	return b.apply(ctx, ep, []Result{{At: now, Success: success, Probe: probe}})
+}
+
+// apply stores results atomically (optimistic WATCH transaction) and returns the last transition.
+func (b *Breaker) apply(ctx context.Context, ep string, rs []Result) (string, error) {
 	var transition string
 	txf := func(tx *redis.Tx) error {
 		s, err := b.getTx(ctx, tx, ep)
 		if err != nil {
 			return err
 		}
-		transition = s.Record(now, success, probe)
+		transition = ""
+		probe := false
+		for _, r := range rs {
+			if tr := s.Record(r.At, r.Success, r.Probe); tr != "" {
+				transition = tr
+			}
+			probe = probe || r.Probe
+		}
 		raw, _ := json.Marshal(s)
 		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 			p.Set(ctx, key(ep), raw, 24*time.Hour)

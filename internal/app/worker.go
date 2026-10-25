@@ -61,6 +61,11 @@ type workerEndpoint struct {
 // NewWorker builds a worker.
 func NewWorker(w Worker) *Worker {
 	w.endpoints = newCache[uuid.UUID, workerEndpoint](5 * time.Second)
+	if w.Breaker != nil {
+		wp := &w
+		w.Breaker.OnTransition = func(ep, to string) { wp.breakerChanged(ep, to, false) }
+		w.Breaker.OnError = func(err error) { wp.Log.Warn("breaker flush failed, failing open", "err", err) }
+	}
 	if w.LockFor == 0 {
 		w.LockFor = 30 * time.Second
 	}
@@ -75,6 +80,15 @@ const perTenantFetch = 10
 
 // Run fetches jobs round-robin across tenant consumers until ctx ends, then waits for in-flight jobs.
 func (w *Worker) Run(ctx context.Context) error {
+	if w.Breaker != nil {
+		// Flushes buffered breaker results; stopped only after in-flight jobs finish
+		// (defers run in reverse: wg.Wait, then stop, then wait for the final flush).
+		fctx, stopFlush := context.WithCancel(context.WithoutCancel(ctx))
+		flushed := make(chan struct{})
+		go func() { defer close(flushed); _ = w.Breaker.FlushLoop(fctx) }()
+		defer func() { <-flushed }()
+		defer stopFlush()
+	}
 	sem := make(chan struct{}, w.Concurrency)
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -329,25 +343,34 @@ func (w *Worker) handle(ctx context.Context, job *pb.DeliveryJob, log *slog.Logg
 		log.WarnContext(ctx, "delivery will retry", "in", next.Delay, "status_code", res.StatusCode, "error_kind", kind)
 	}
 	if w.Breaker != nil && outcome != delivery.Permanent {
-		tr, err := w.Breaker.Record(ctx, job.EndpointId, time.Now(), outcome == delivery.Success, dec.NeedProbe)
-		if err != nil {
-			log.WarnContext(ctx, "breaker record failed", "err", err)
-		}
-		if tr != "" {
-			telemetry.BreakerTransitions.WithLabelValues(tr).Inc()
-			// ponytail: per-pod gauge of transitions; sum across pods approximates open breakers. Exact count needs a Redis scan.
-			switch tr {
-			case breaker.Open:
-				if !dec.NeedProbe {
-					telemetry.BreakersOpen.Inc()
-				}
-			case breaker.Closed:
-				telemetry.BreakersOpen.Dec()
+		if dec.NeedProbe {
+			tr, err := w.Breaker.Record(ctx, job.EndpointId, time.Now(), outcome == delivery.Success, true)
+			if err != nil {
+				log.WarnContext(ctx, "breaker record failed", "err", err)
 			}
-			log.WarnContext(ctx, "circuit breaker changed", "to", tr)
+			w.breakerChanged(job.EndpointId, tr, true)
+		} else {
+			w.Breaker.Observe(job.EndpointId, time.Now(), outcome == delivery.Success)
 		}
 	}
 	return action{}, nil
+}
+
+// breakerChanged logs and counts a transition. fromProbe: a failed probe re-opens an
+// already-open breaker, which is not a new open breaker for the gauge.
+func (w *Worker) breakerChanged(ep, to string, fromProbe bool) {
+	if to == "" {
+		return
+	}
+	telemetry.BreakerTransitions.WithLabelValues(to).Inc()
+	// ponytail: per-pod gauge of transitions; sum across pods approximates open breakers. Exact count needs a Redis scan.
+	switch {
+	case to == breaker.Open && !fromProbe:
+		telemetry.BreakersOpen.Inc()
+	case to == breaker.Closed:
+		telemetry.BreakersOpen.Dec()
+	}
+	w.Log.Warn("circuit breaker changed", "endpoint_id", ep, "to", to)
 }
 
 func (w *Worker) releaseProbe(ctx context.Context, ep string) {

@@ -517,7 +517,19 @@ func (c *Control) EnableEndpoint(ctx context.Context, req *pb.EnableEndpointRequ
 	if err != nil {
 		return nil, err
 	}
+	c.resetBreaker(ctx, ep.Id)
 	return &pb.EnableEndpointResponse{Endpoint: ep}, nil
+}
+
+// resetBreaker clears an endpoint's circuit breaker: replaying or re-enabling means the
+// operator believes the endpoint is fixed. If it is not, the breaker opens again.
+func (c *Control) resetBreaker(ctx context.Context, endpointID string) {
+	if c.Breaker == nil {
+		return
+	}
+	if err := c.Breaker.Reset(ctx, endpointID); err != nil {
+		c.Log.WarnContext(ctx, "reset breaker", "endpoint_id", endpointID, "err", err)
+	}
 }
 
 // DisableEndpoint disables an endpoint manually.
@@ -750,6 +762,7 @@ func (c *Control) ReplayDelivery(ctx context.Context, req *pb.ReplayDeliveryRequ
 	if err != nil {
 		return nil, err
 	}
+	c.resetBreaker(ctx, domain.FormatID(domain.PrefixEndpoint, d.EndpointID))
 	// If this publish is lost, the scheduler's stuck-pending reconciliation republishes it.
 	if err := publishJob(ctx, c.Queue, ref(d), "r"+strconv.Itoa(int(d.ReplayCount))); err != nil {
 		c.Log.WarnContext(ctx, "replay publish failed; reconciliation will retry", "delivery_id", req.Id, "err", err)
@@ -763,6 +776,7 @@ func (c *Control) ReplayEndpoint(ctx context.Context, req *pb.ReplayEndpointRequ
 	if err != nil {
 		return nil, err
 	}
+	c.resetBreaker(ctx, req.EndpointId)
 	q := store.New(c.Pool)
 	var total int64
 	for {
