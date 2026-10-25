@@ -10,6 +10,13 @@ spec:
     parameters:
       max_connections: {{ .Values.postgres.maxConnections | quote }}
       shared_buffers: {{ .Values.postgres.sharedBuffers | quote }}
+      # Write-heavy tuning: timed checkpoints instead of forced ones.
+      max_wal_size: 8GB
+      min_wal_size: 1GB
+      checkpoint_timeout: 15min
+      checkpoint_completion_target: "0.9"
+      wal_compression: lz4
+      wal_buffers: 64MB
   bootstrap:
     initdb:
       database: hookline

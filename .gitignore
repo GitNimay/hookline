@@ -7,3 +7,6 @@ loadtest/results/
 *.test
 deploy/values/secrets*.yaml
 *.log
+k6-*.json
+k6-*.txt
+bench-*.txt

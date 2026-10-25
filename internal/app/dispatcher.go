@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/proto"
 
@@ -113,17 +114,24 @@ func (d *Dispatcher) handle(ctx context.Context, msg jetstream.Msg) error {
 	if err != nil {
 		return err
 	}
-	var published float64
+	// Publish all jobs of the fan-out at once and wait for every ack.
+	var msgs []*nats.Msg
+	var msgIDs []string
 	for _, r := range rows {
 		if r.Status != domain.StatusPending || r.AttemptCount != 0 || r.ReplayCount != 0 {
 			continue // already in progress or replayed; those paths publish their own jobs
 		}
-		if err := publishJob(ctx, d.Queue, ref(r), "d"); err != nil {
+		tenant, dj, id := jobFor(ref(r), "d")
+		m, err := queue.Msg(ctx, domain.DeliveriesSubject(tenant), dj)
+		if err != nil {
 			return err
 		}
-		published++
+		msgs, msgIDs = append(msgs, m), append(msgIDs, id)
 	}
-	telemetry.DeliveriesCreated.WithLabelValues(job.TenantId).Add(published)
+	if _, err := d.Queue.PublishAll(ctx, msgs, msgIDs); err != nil {
+		return err // naked and redelivered; republishing the acked ones is deduplicated
+	}
+	telemetry.DeliveriesCreated.WithLabelValues(job.TenantId).Add(float64(len(msgs)))
 	return nil
 }
 

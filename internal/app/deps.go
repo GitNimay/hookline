@@ -23,6 +23,9 @@ func OpenPostgres(ctx context.Context, c config.Postgres) (*pgxpool.Pool, error)
 	pc.ConnConfig.ConnectTimeout = 5 * time.Second
 	// Statement timeout on the server side backs up the context deadlines in code.
 	pc.ConnConfig.RuntimeParams["statement_timeout"] = fmt.Sprint(c.QueryTimeout.Milliseconds())
+	if !c.SyncCommit {
+		pc.ConnConfig.RuntimeParams["synchronous_commit"] = "off"
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
 		return nil, err

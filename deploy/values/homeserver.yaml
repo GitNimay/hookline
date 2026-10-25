@@ -37,6 +37,7 @@ services:
     env:
       WORKER_CONCURRENCY: "100"
       DB_MAX_CONNS: "30"
+      DB_SYNCHRONOUS_COMMIT: "false"
     resources:
       requests: { cpu: 100m, memory: 96Mi }
       limits: { cpu: "1", memory: 256Mi }

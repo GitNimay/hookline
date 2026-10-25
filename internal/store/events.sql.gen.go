@@ -117,59 +117,98 @@ func (q *Queries) GetEvent(ctx context.Context, arg GetEventParams) (Event, erro
 	return i, err
 }
 
-const getEventIDByIdempotencyKey = `-- name: GetEventIDByIdempotencyKey :one
-SELECT id FROM events WHERE tenant_id = $1 AND idempotency_key = $2
+const getEventIDsByIdempotencyKeys = `-- name: GetEventIDsByIdempotencyKeys :many
+SELECT idempotency_key::text AS idempotency_key, id FROM events
+WHERE tenant_id = $1 AND idempotency_key = ANY($2::text[])
 `
 
-type GetEventIDByIdempotencyKeyParams struct {
-	TenantID       uuid.UUID
-	IdempotencyKey *string
+type GetEventIDsByIdempotencyKeysParams struct {
+	TenantID uuid.UUID
+	Keys     []string
 }
 
-func (q *Queries) GetEventIDByIdempotencyKey(ctx context.Context, arg GetEventIDByIdempotencyKeyParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, getEventIDByIdempotencyKey, arg.TenantID, arg.IdempotencyKey)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
-}
-
-const insertEventWithOutbox = `-- name: InsertEventWithOutbox :one
-WITH e AS (
-    INSERT INTO events (id, tenant_id, event_type, payload, idempotency_key, occurred_at, trace_parent)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
-    ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-    RETURNING id, tenant_id
-), o AS (
-    INSERT INTO outbox (event_id, tenant_id) SELECT id, tenant_id FROM e RETURNING event_id
-)
-SELECT event_id FROM o
-`
-
-type InsertEventWithOutboxParams struct {
+type GetEventIDsByIdempotencyKeysRow struct {
+	IdempotencyKey string
 	ID             uuid.UUID
-	TenantID       uuid.UUID
-	EventType      string
-	Payload        []byte
-	IdempotencyKey *string
-	OccurredAt     time.Time
-	TraceParent    string
 }
 
-// Event and outbox row in one atomic statement (one round trip). No row means the
-// idempotency key already exists for the tenant.
-func (q *Queries) InsertEventWithOutbox(ctx context.Context, arg InsertEventWithOutboxParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, insertEventWithOutbox,
-		arg.ID,
+func (q *Queries) GetEventIDsByIdempotencyKeys(ctx context.Context, arg GetEventIDsByIdempotencyKeysParams) ([]GetEventIDsByIdempotencyKeysRow, error) {
+	rows, err := q.db.Query(ctx, getEventIDsByIdempotencyKeys, arg.TenantID, arg.Keys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetEventIDsByIdempotencyKeysRow
+	for rows.Next() {
+		var i GetEventIDsByIdempotencyKeysRow
+		if err := rows.Scan(&i.IdempotencyKey, &i.ID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const insertEventsWithOutbox = `-- name: InsertEventsWithOutbox :many
+WITH input AS (
+    SELECT unnest($1::uuid[]) AS id,
+           unnest($2::text[]) AS event_type,
+           unnest($3::text[])::jsonb AS payload,
+           unnest($4::text[]) AS idem,
+           unnest($5::timestamptz[]) AS occurred_at
+), e AS (
+    INSERT INTO events (id, tenant_id, event_type, payload, idempotency_key, occurred_at, trace_parent)
+    SELECT input.id, $6::uuid, input.event_type, input.payload, NULLIF(input.idem, ''), input.occurred_at, $7::text
+    FROM input
+    ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+    RETURNING events.id, events.tenant_id
+), o AS (
+    INSERT INTO outbox (event_id, tenant_id) SELECT e.id, e.tenant_id FROM e RETURNING outbox.event_id
+)
+SELECT o.event_id FROM o
+`
+
+type InsertEventsWithOutboxParams struct {
+	Ids             []uuid.UUID
+	EventTypes      []string
+	Payloads        []string
+	IdempotencyKeys []string
+	OccurredAts     []time.Time
+	TenantID        uuid.UUID
+	TraceParent     string
+}
+
+// Events and their outbox rows in one atomic statement (one round trip, any batch size).
+// Events whose idempotency key already exists are skipped and not returned.
+func (q *Queries) InsertEventsWithOutbox(ctx context.Context, arg InsertEventsWithOutboxParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, insertEventsWithOutbox,
+		arg.Ids,
+		arg.EventTypes,
+		arg.Payloads,
+		arg.IdempotencyKeys,
+		arg.OccurredAts,
 		arg.TenantID,
-		arg.EventType,
-		arg.Payload,
-		arg.IdempotencyKey,
-		arg.OccurredAt,
 		arg.TraceParent,
 	)
-	var event_id uuid.UUID
-	err := row.Scan(&event_id)
-	return event_id, err
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var event_id uuid.UUID
+		if err := rows.Scan(&event_id); err != nil {
+			return nil, err
+		}
+		items = append(items, event_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listEvents = `-- name: ListEvents :many

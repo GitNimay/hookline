@@ -114,34 +114,7 @@ func (s *Ingest) ingest(ctx context.Context, reqs []*pb.SendEventRequest) ([]*pb
 	}
 
 	traceParent := telemetry.TraceParent(ctx)
-	out := make([]*pb.SendEventResponse, len(evs))
-	insert := func(q *store.Queries) error {
-		for i, e := range evs {
-			id, err := q.InsertEventWithOutbox(ctx, store.InsertEventWithOutboxParams{
-				ID: domain.NewID(), TenantID: tenantID, EventType: e.typ, Payload: e.payload,
-				IdempotencyKey: e.key, OccurredAt: e.at, TraceParent: traceParent,
-			})
-			if errors.Is(err, pgx.ErrNoRows) { // idempotency key seen before
-				id, err = q.GetEventIDByIdempotencyKey(ctx, store.GetEventIDByIdempotencyKeyParams{TenantID: tenantID, IdempotencyKey: e.key})
-				if err != nil {
-					return err
-				}
-				out[i] = &pb.SendEventResponse{Id: domain.FormatID(domain.PrefixEvent, id), Duplicate: true}
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			out[i] = &pb.SendEventResponse{Id: domain.FormatID(domain.PrefixEvent, id)}
-		}
-		return nil
-	}
-	if len(evs) == 1 {
-		// One statement is already atomic: skip BEGIN/COMMIT round trips.
-		err = insert(store.New(s.Pool))
-	} else {
-		err = pgx.BeginTxFunc(ctx, s.Pool, pgx.TxOptions{}, func(tx pgx.Tx) error { return insert(store.New(tx)) })
-	}
+	out, err := s.store(ctx, tenantID, traceParent, evs)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +128,58 @@ func (s *Ingest) ingest(ctx context.Context, reqs []*pb.SendEventRequest) ([]*pb
 	select { // wake the relay; never block
 	case s.Notify <- struct{}{}:
 	default:
+	}
+	return out, nil
+}
+
+// store writes events and outbox rows in one statement. Events whose idempotency key
+// already exists come back as duplicates carrying the original ID.
+func (s *Ingest) store(ctx context.Context, tenantID uuid.UUID, traceParent string, evs []validEvent) ([]*pb.SendEventResponse, error) {
+	p := store.InsertEventsWithOutboxParams{TenantID: tenantID, TraceParent: traceParent}
+	for _, e := range evs {
+		key := ""
+		if e.key != nil {
+			key = *e.key
+		}
+		p.Ids = append(p.Ids, domain.NewID())
+		p.EventTypes = append(p.EventTypes, e.typ)
+		p.Payloads = append(p.Payloads, string(e.payload))
+		p.IdempotencyKeys = append(p.IdempotencyKeys, key)
+		p.OccurredAts = append(p.OccurredAts, e.at)
+	}
+	q := store.New(s.Pool)
+	inserted, err := q.InsertEventsWithOutbox(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	ok := make(map[uuid.UUID]bool, len(inserted))
+	for _, id := range inserted {
+		ok[id] = true
+	}
+	out := make([]*pb.SendEventResponse, len(evs))
+	var dupKeys []string
+	for i, id := range p.Ids {
+		if ok[id] {
+			out[i] = &pb.SendEventResponse{Id: domain.FormatID(domain.PrefixEvent, id)}
+		} else {
+			dupKeys = append(dupKeys, p.IdempotencyKeys[i])
+		}
+	}
+	if len(dupKeys) == 0 {
+		return out, nil
+	}
+	rows, err := q.GetEventIDsByIdempotencyKeys(ctx, store.GetEventIDsByIdempotencyKeysParams{TenantID: tenantID, Keys: dupKeys})
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]uuid.UUID, len(rows))
+	for _, r := range rows {
+		existing[r.IdempotencyKey] = r.ID
+	}
+	for i := range out {
+		if out[i] == nil {
+			out[i] = &pb.SendEventResponse{Id: domain.FormatID(domain.PrefixEvent, existing[p.IdempotencyKeys[i]]), Duplicate: true}
+		}
 	}
 	return out, nil
 }

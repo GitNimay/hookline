@@ -30,6 +30,9 @@ type Postgres struct {
 	DatabaseURL  string        `env:"DATABASE_URL,notEmpty"`
 	DBMaxConns   int32         `env:"DB_MAX_CONNS" envDefault:"20"`
 	QueryTimeout time.Duration `env:"DB_QUERY_TIMEOUT" envDefault:"5s"`
+	// SyncCommit is Postgres synchronous_commit for this service's sessions. Only the worker
+	// may turn it off: its state is re-derivable (ADR-010); ingest and dispatcher must not.
+	SyncCommit bool `env:"DB_SYNCHRONOUS_COMMIT" envDefault:"true"`
 }
 
 // NATS holds queue settings.

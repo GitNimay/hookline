@@ -1,18 +1,26 @@
--- name: InsertEventWithOutbox :one
--- Event and outbox row in one atomic statement (one round trip). No row means the
--- idempotency key already exists for the tenant.
-WITH e AS (
+-- name: InsertEventsWithOutbox :many
+-- Events and their outbox rows in one atomic statement (one round trip, any batch size).
+-- Events whose idempotency key already exists are skipped and not returned.
+WITH input AS (
+    SELECT unnest(sqlc.arg(ids)::uuid[]) AS id,
+           unnest(sqlc.arg(event_types)::text[]) AS event_type,
+           unnest(sqlc.arg(payloads)::text[])::jsonb AS payload,
+           unnest(sqlc.arg(idempotency_keys)::text[]) AS idem,
+           unnest(sqlc.arg(occurred_ats)::timestamptz[]) AS occurred_at
+), e AS (
     INSERT INTO events (id, tenant_id, event_type, payload, idempotency_key, occurred_at, trace_parent)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    SELECT input.id, sqlc.arg(tenant_id)::uuid, input.event_type, input.payload, NULLIF(input.idem, ''), input.occurred_at, sqlc.arg(trace_parent)::text
+    FROM input
     ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-    RETURNING id, tenant_id
+    RETURNING events.id, events.tenant_id
 ), o AS (
-    INSERT INTO outbox (event_id, tenant_id) SELECT id, tenant_id FROM e RETURNING event_id
+    INSERT INTO outbox (event_id, tenant_id) SELECT e.id, e.tenant_id FROM e RETURNING outbox.event_id
 )
-SELECT event_id FROM o;
+SELECT o.event_id FROM o;
 
--- name: GetEventIDByIdempotencyKey :one
-SELECT id FROM events WHERE tenant_id = $1 AND idempotency_key = $2;
+-- name: GetEventIDsByIdempotencyKeys :many
+SELECT idempotency_key::text AS idempotency_key, id FROM events
+WHERE tenant_id = $1 AND idempotency_key = ANY(sqlc.arg(keys)::text[]);
 
 -- name: GetEvent :one
 SELECT * FROM events WHERE id = $1 AND tenant_id = $2;

@@ -23,6 +23,12 @@ type jobRef struct {
 // publishJob publishes the job for the delivery's next attempt. nonce makes the NATS
 // message ID unique per schedule, so a legitimate republish is not deduplicated away.
 func publishJob(ctx context.Context, q *queue.Queue, r jobRef, nonce string) error {
+	tenant, job, id := jobFor(r, nonce)
+	return q.PublishDelivery(ctx, tenant, job, id)
+}
+
+// jobFor builds the job message, its tenant and its NATS message ID.
+func jobFor(r jobRef, nonce string) (string, *pb.DeliveryJob, string) {
 	dlv := domain.FormatID(domain.PrefixDelivery, r.ID)
 	tenant := domain.FormatID(domain.PrefixTenant, r.TenantID)
 	job := &pb.DeliveryJob{
@@ -36,7 +42,7 @@ func publishJob(ctx context.Context, q *queue.Queue, r jobRef, nonce string) err
 		r.Due = time.Now()
 	}
 	job.ScheduledUnixMs = r.Due.UnixMilli()
-	return q.PublishDelivery(ctx, tenant, job, domain.JobMsgID(dlv, job.Attempt, nonce))
+	return tenant, job, domain.JobMsgID(dlv, job.Attempt, nonce)
 }
 
 func isUniqueViolation(err error) bool {
