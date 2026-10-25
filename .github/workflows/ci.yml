@@ -55,7 +55,6 @@ jobs:
 
   helm:
     runs-on: ubuntu-24.04
-    if: hashFiles('deploy/helm/hookline/Chart.yaml') != ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
@@ -63,6 +62,7 @@ jobs:
           version: v3.19.0
       - name: Lint and render the chart with every values file
         run: |
+          test -f deploy/helm/hookline/Chart.yaml || { echo "chart not created yet"; exit 0; }
           helm lint deploy/helm/hookline
           for v in deploy/values/local.yaml deploy/values/homeserver.yaml; do
             helm lint deploy/helm/hookline -f "$v"
