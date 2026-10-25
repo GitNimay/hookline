@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package hookline.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+// EventTypeService manages the tenant's catalogue of event types.
+service EventTypeService {
+  rpc CreateEventType(CreateEventTypeRequest) returns (CreateEventTypeResponse) {
+    option (google.api.http) = {
+      post: "/v1/event-types"
+      body: "*"
+    };
+  }
+  rpc ListEventTypes(ListEventTypesRequest) returns (ListEventTypesResponse) {
+    option (google.api.http) = {get: "/v1/event-types"};
+  }
+  rpc DeleteEventType(DeleteEventTypeRequest) returns (DeleteEventTypeResponse) {
+    option (google.api.http) = {delete: "/v1/event-types/{name}"};
+  }
+}
+
+message EventType {
+  string name = 1;
+  string description = 2;
+  google.protobuf.Timestamp create_time = 3;
+}
+
+message CreateEventTypeRequest {
+  string name = 1;
+  string description = 2;
+}
+
+message CreateEventTypeResponse {
+  EventType event_type = 1;
+}
+
+message ListEventTypesRequest {}
+
+message ListEventTypesResponse {
+  repeated EventType event_types = 1;
+}
+
+message DeleteEventTypeRequest {
+  string name = 1;
+}
+
+message DeleteEventTypeResponse {}

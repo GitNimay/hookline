@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package hookline.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// EventService reads stored events.
+service EventService {
+  rpc GetEvent(GetEventRequest) returns (GetEventResponse) {
+    option (google.api.http) = {get: "/v1/events/{id}"};
+  }
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse) {
+    option (google.api.http) = {get: "/v1/events"};
+  }
+}
+
+message Event {
+  string id = 1;
+  string event_type = 2;
+  google.protobuf.Struct payload = 3;
+  string idempotency_key = 4;
+  google.protobuf.Timestamp occur_time = 5;
+  google.protobuf.Timestamp create_time = 6;
+}
+
+message GetEventRequest {
+  string id = 1;
+}
+
+message GetEventResponse {
+  Event event = 1;
+}
+
+message ListEventsRequest {
+  string event_type = 1;
+  google.protobuf.Timestamp start_time = 2;
+  google.protobuf.Timestamp end_time = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListEventsResponse {
+  repeated Event events = 1;
+  string next_page_token = 2;
+}

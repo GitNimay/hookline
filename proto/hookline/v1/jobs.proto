@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package hookline.v1;
+
+// EventJob is the NATS message on events.<tenant_id>. IDs only; payloads stay in Postgres.
+message EventJob {
+  string event_id = 1;
+  string tenant_id = 2;
+  string event_type = 3;
+}
+
+// DeliveryJob is the NATS message on deliveries.<tenant_id>.
+message DeliveryJob {
+  string delivery_id = 1;
+  string event_id = 2;
+  string endpoint_id = 3;
+  string tenant_id = 4;
+  // The attempt number this job performs (attempt_count + 1 when published).
+  int32 attempt = 5;
+}

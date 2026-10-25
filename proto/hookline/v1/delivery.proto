@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package hookline.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+// DeliveryService queries deliveries and attempts, and replays dead letters.
+service DeliveryService {
+  rpc ListDeliveries(ListDeliveriesRequest) returns (ListDeliveriesResponse) {
+    option (google.api.http) = {get: "/v1/deliveries"};
+  }
+  rpc GetDelivery(GetDeliveryRequest) returns (GetDeliveryResponse) {
+    option (google.api.http) = {get: "/v1/deliveries/{id}"};
+  }
+  rpc ListDeliveryAttempts(ListDeliveryAttemptsRequest) returns (ListDeliveryAttemptsResponse) {
+    option (google.api.http) = {get: "/v1/deliveries/{id}/attempts"};
+  }
+  rpc ReplayDelivery(ReplayDeliveryRequest) returns (ReplayDeliveryResponse) {
+    option (google.api.http) = {
+      post: "/v1/deliveries/{id}:replay"
+      body: "*"
+    };
+  }
+  // ReplayEndpoint replays all dead deliveries of an endpoint, or every delivery since a time.
+  rpc ReplayEndpoint(ReplayEndpointRequest) returns (ReplayEndpointResponse) {
+    option (google.api.http) = {
+      post: "/v1/endpoints/{endpoint_id}:replay"
+      body: "*"
+    };
+  }
+}
+
+message Delivery {
+  string id = 1;
+  string event_id = 2;
+  string endpoint_id = 3;
+  // "pending", "retrying", "succeeded" or "dead".
+  string status = 4;
+  int32 attempt_count = 5;
+  google.protobuf.Timestamp next_attempt_time = 6;
+  google.protobuf.Timestamp last_attempt_time = 7;
+  int32 last_status_code = 8;
+  string last_error = 9;
+  string dead_reason = 10;
+  google.protobuf.Timestamp succeed_time = 11;
+  google.protobuf.Timestamp create_time = 12;
+  google.protobuf.Timestamp update_time = 13;
+}
+
+message Attempt {
+  string id = 1;
+  string delivery_id = 2;
+  int32 attempt_number = 3;
+  google.protobuf.Timestamp start_time = 4;
+  int32 duration_ms = 5;
+  int32 status_code = 6;
+  string error_kind = 7;
+  string error_message = 8;
+  string response_body_snippet = 9;
+}
+
+message ListDeliveriesRequest {
+  string event_id = 1;
+  string endpoint_id = 2;
+  string status = 3;
+  google.protobuf.Timestamp start_time = 4;
+  google.protobuf.Timestamp end_time = 5;
+  int32 page_size = 6;
+  string page_token = 7;
+}
+
+message ListDeliveriesResponse {
+  repeated Delivery deliveries = 1;
+  string next_page_token = 2;
+}
+
+message GetDeliveryRequest {
+  string id = 1;
+}
+
+message GetDeliveryResponse {
+  Delivery delivery = 1;
+}
+
+message ListDeliveryAttemptsRequest {
+  string id = 1;
+}
+
+message ListDeliveryAttemptsResponse {
+  repeated Attempt attempts = 1;
+}
+
+message ReplayDeliveryRequest {
+  string id = 1;
+}
+
+message ReplayDeliveryResponse {
+  Delivery delivery = 1;
+}
+
+message ReplayEndpointRequest {
+  string endpoint_id = 1;
+  // When set, replays every delivery created since this time; otherwise all dead deliveries.
+  google.protobuf.Timestamp since = 2;
+}
+
+message ReplayEndpointResponse {
+  int64 replayed = 1;
+}

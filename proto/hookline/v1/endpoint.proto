@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package hookline.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// EndpointService manages a tenant's webhook endpoints.
+service EndpointService {
+  rpc CreateEndpoint(CreateEndpointRequest) returns (CreateEndpointResponse) {
+    option (google.api.http) = {
+      post: "/v1/endpoints"
+      body: "*"
+    };
+  }
+  rpc GetEndpoint(GetEndpointRequest) returns (GetEndpointResponse) {
+    option (google.api.http) = {get: "/v1/endpoints/{id}"};
+  }
+  rpc ListEndpoints(ListEndpointsRequest) returns (ListEndpointsResponse) {
+    option (google.api.http) = {get: "/v1/endpoints"};
+  }
+  rpc UpdateEndpoint(UpdateEndpointRequest) returns (UpdateEndpointResponse) {
+    option (google.api.http) = {
+      patch: "/v1/endpoints/{id}"
+      body: "endpoint"
+    };
+  }
+  rpc DeleteEndpoint(DeleteEndpointRequest) returns (DeleteEndpointResponse) {
+    option (google.api.http) = {delete: "/v1/endpoints/{id}"};
+  }
+  rpc EnableEndpoint(EnableEndpointRequest) returns (EnableEndpointResponse) {
+    option (google.api.http) = {
+      post: "/v1/endpoints/{id}:enable"
+      body: "*"
+    };
+  }
+  rpc DisableEndpoint(DisableEndpointRequest) returns (DisableEndpointResponse) {
+    option (google.api.http) = {
+      post: "/v1/endpoints/{id}:disable"
+      body: "*"
+    };
+  }
+  rpc GetEndpointSecret(GetEndpointSecretRequest) returns (GetEndpointSecretResponse) {
+    option (google.api.http) = {get: "/v1/endpoints/{id}/secret"};
+  }
+  rpc RotateEndpointSecret(RotateEndpointSecretRequest) returns (RotateEndpointSecretResponse) {
+    option (google.api.http) = {
+      post: "/v1/endpoints/{id}/secret:rotate"
+      body: "*"
+    };
+  }
+  rpc SendTestEvent(SendTestEventRequest) returns (SendTestEventResponse) {
+    option (google.api.http) = {
+      post: "/v1/endpoints/{id}:test"
+      body: "*"
+    };
+  }
+  // ListMatchingEndpoints is internal (dispatcher only); it has no REST route.
+  rpc ListMatchingEndpoints(ListMatchingEndpointsRequest) returns (ListMatchingEndpointsResponse);
+}
+
+message Endpoint {
+  string id = 1;
+  string url = 2;
+  string description = 3;
+  // Subscribed event types; "*" matches all.
+  repeated string event_types = 4;
+  map<string, string> custom_headers = 5;
+  int32 rate_limit_per_sec = 6;
+  // "enabled" or "disabled".
+  string status = 7;
+  string disabled_reason = 8;
+  google.protobuf.Timestamp failing_since = 9;
+  // "closed", "open" or "half_open".
+  string circuit_state = 10;
+  google.protobuf.Timestamp create_time = 11;
+  google.protobuf.Timestamp update_time = 12;
+}
+
+message EndpointSecret {
+  string secret = 1;
+  google.protobuf.Timestamp create_time = 2;
+  google.protobuf.Timestamp expire_time = 3;
+}
+
+message CreateEndpointRequest {
+  string url = 1;
+  string description = 2;
+  repeated string event_types = 3;
+  map<string, string> custom_headers = 4;
+  int32 rate_limit_per_sec = 5;
+}
+
+message CreateEndpointResponse {
+  Endpoint endpoint = 1;
+}
+
+message GetEndpointRequest {
+  string id = 1;
+}
+
+message GetEndpointResponse {
+  Endpoint endpoint = 1;
+}
+
+message ListEndpointsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListEndpointsResponse {
+  repeated Endpoint endpoints = 1;
+  string next_page_token = 2;
+}
+
+message UpdateEndpointRequest {
+  string id = 1;
+  Endpoint endpoint = 2;
+  // Filled automatically from the JSON body keys by the REST gateway.
+  google.protobuf.FieldMask update_mask = 3;
+}
+
+message UpdateEndpointResponse {
+  Endpoint endpoint = 1;
+}
+
+message DeleteEndpointRequest {
+  string id = 1;
+}
+
+message DeleteEndpointResponse {}
+
+message EnableEndpointRequest {
+  string id = 1;
+}
+
+message EnableEndpointResponse {
+  Endpoint endpoint = 1;
+}
+
+message DisableEndpointRequest {
+  string id = 1;
+}
+
+message DisableEndpointResponse {
+  Endpoint endpoint = 1;
+}
+
+message GetEndpointSecretRequest {
+  string id = 1;
+}
+
+message GetEndpointSecretResponse {
+  // Active secrets, newest first. Two during a rotation overlap.
+  repeated EndpointSecret secrets = 1;
+}
+
+message RotateEndpointSecretRequest {
+  string id = 1;
+}
+
+message RotateEndpointSecretResponse {
+  repeated EndpointSecret secrets = 1;
+}
+
+message SendTestEventRequest {
+  string id = 1;
+  string event_type = 2;
+  google.protobuf.Struct payload = 3;
+}
+
+message SendTestEventResponse {
+  int32 status_code = 1;
+  int64 duration_ms = 2;
+  string error_kind = 3;
+  string response_body_snippet = 4;
+}
+
+message ListMatchingEndpointsRequest {
+  string tenant_id = 1;
+  string event_type = 2;
+}
+
+message ListMatchingEndpointsResponse {
+  repeated string endpoint_ids = 1;
+}

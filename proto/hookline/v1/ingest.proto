@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package hookline.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// IngestService accepts events from producer apps.
+service IngestService {
+  // SendEvent stores one event durably and queues it for fan-out.
+  rpc SendEvent(SendEventRequest) returns (SendEventResponse) {
+    option (google.api.http) = {
+      post: "/v1/events"
+      body: "*"
+    };
+  }
+  // SendEventBatch stores up to 100 events in one transaction.
+  rpc SendEventBatch(SendEventBatchRequest) returns (SendEventBatchResponse) {
+    option (google.api.http) = {
+      post: "/v1/events:batch"
+      body: "*"
+    };
+  }
+}
+
+message SendEventRequest {
+  // Must exist in the tenant's event type catalogue.
+  string event_type = 1;
+  // JSON object, max 256 KB.
+  google.protobuf.Struct payload = 2;
+  // Optional, max 255 chars, unique per tenant for 24 h.
+  string idempotency_key = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+}
+
+message SendEventResponse {
+  string id = 1;
+  // True when the idempotency key matched an existing event.
+  bool duplicate = 2;
+}
+
+message SendEventBatchRequest {
+  repeated SendEventRequest events = 1;
+}
+
+message SendEventBatchResponse {
+  repeated SendEventResponse results = 1;
+}
