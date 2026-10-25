@@ -1,0 +1,69 @@
+# Kill one pod of each Hookline service and NATS every 2 minutes while load runs.
+# Expectation: zero lost events, duplicates < 0.1% (hookctl verify / e2e TestRestartsUnderLoad).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kill-worker
+  namespace: hookline
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Forbid
+  historyLimit: 3
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [hookline]
+      labelSelectors: { app.kubernetes.io/component: worker }
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kill-dispatcher
+  namespace: hookline
+spec:
+  schedule: "1-59/2 * * * *"
+  concurrencyPolicy: Forbid
+  historyLimit: 3
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [hookline]
+      labelSelectors: { app.kubernetes.io/component: dispatcher }
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kill-ingest
+  namespace: hookline
+spec:
+  schedule: "*/3 * * * *"
+  concurrencyPolicy: Forbid
+  historyLimit: 3
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [hookline]
+      labelSelectors: { app.kubernetes.io/component: ingest }
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: kill-nats
+  namespace: infra
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  historyLimit: 3
+  type: PodChaos
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [infra]
+      labelSelectors: { app.kubernetes.io/name: nats }

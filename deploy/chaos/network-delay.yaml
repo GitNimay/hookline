@@ -1,0 +1,21 @@
+# 300 ms +-100 ms latency on every request from workers to the chaos customer for 5 minutes.
+# Expectation: throughput drops, no failures, end-to-end p99 rises by ~the delay.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: endpoint-latency
+  namespace: hookline
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: [hookline]
+    labelSelectors: { app.kubernetes.io/component: worker }
+  direction: to
+  target:
+    mode: all
+    selector:
+      namespaces: [hookline]
+      labelSelectors: { app.kubernetes.io/component: chaos-customer }
+  delay: { latency: 300ms, jitter: 100ms, correlation: "50" }
+  duration: 5m

@@ -1,0 +1,47 @@
+name: e2e
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+      - name: Start the stack
+        run: make compose-up
+      - name: Seed
+        run: make seed
+      - name: End-to-end scenarios
+        env:
+          E2E_EVENTS: "2000"
+          E2E_DESTRUCTIVE: "1"
+        run: make test-e2e
+      - name: k6 smoke (2 minutes)
+        run: |
+          set -a; . ./.env; set +a
+          k6 run -e DURATION=2m -e EVENTS_PER_SEC=200 --summary-export k6-summary.json loadtest/steady.js
+      - name: Collect logs
+        if: failure()
+        run: docker compose --env-file .env -f deploy/compose/docker-compose.yml logs --no-color > compose.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-logs
+          path: |
+            compose.log
+            k6-summary.json

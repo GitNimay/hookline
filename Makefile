@@ -16,7 +16,7 @@ RACE         ?= $(if $(filter Windows_NT,$(OS)),,-race)
 PYTHON       ?= $(if $(filter Windows_NT,$(OS)),python,python3)
 
 .PHONY: help tools gen lint test test-integration test-e2e cover build images compose-up compose-up-tracing compose-down compose-logs \
-        seed demo demo-full secrets-local cluster-up cluster-down cluster-reset deploy-local deploy-homeserver loadtest chaos
+        seed demo demo-full secrets-local cluster-up cluster-down cluster-reset deploy-local deploy-homeserver loadtest chaos chaos-stop
 
 help: ## Show targets
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -49,8 +49,8 @@ test: ## Unit tests with the race detector
 test-integration: ## Integration tests against real Postgres/NATS/Redis (testcontainers; needs Docker)
 	go test $(RACE) -count=1 -tags=integration -timeout=15m ./...
 
-test-e2e: ## End-to-end scenarios against the running Compose stack
-	go test -count=1 -tags=e2e -timeout=30m -v ./e2e/...
+test-e2e: ## End-to-end scenarios against the running stack (Compose or k3d); E2E_DESTRUCTIVE=1 adds restarts
+	. scripts/target-env.sh && go test -count=1 -tags=e2e -timeout=45m -v ./e2e/...
 
 cover: ## Coverage for the core packages
 	go test -coverprofile=coverage.out ./internal/delivery ./internal/breaker ./internal/ratelimit ./internal/signing ./internal/ssrf
@@ -126,5 +126,9 @@ deploy-homeserver: ## Deploy everything to the home server cluster (current kube
 loadtest: ## Run the k6 steady-load test (K6_SCRIPT=loadtest/steady.js)
 	k6 run $${K6_SCRIPT:-loadtest/steady.js}
 
-chaos: ## Apply the Chaos Mesh experiments to the local cluster
+chaos: ## Install Chaos Mesh (on demand) and apply the experiments to the local cluster
+	$(HELMFILE) -e local --state-values-set chaosMesh=true sync --selector name=chaos-mesh
 	kubectl apply -f deploy/chaos/
+
+chaos-stop: ## Remove the Chaos Mesh experiments
+	kubectl delete -f deploy/chaos/ --ignore-not-found

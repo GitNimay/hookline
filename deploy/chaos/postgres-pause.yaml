@@ -1,0 +1,15 @@
+# Postgres unavailable for 60 s. Expectation: ingest returns 5xx meanwhile (nothing is
+# accepted that is not stored), workers nak and retry, and no accepted event is lost once
+# Postgres is back.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: postgres-pause
+  namespace: infra
+spec:
+  action: pod-failure
+  mode: one
+  selector:
+    namespaces: [infra]
+    labelSelectors: { cnpg.io/cluster: hookline-pg }
+  duration: 60s
