@@ -12,6 +12,76 @@ import (
 	"github.com/google/uuid"
 )
 
+const claimDeliveriesWithEvents = `-- name: ClaimDeliveriesWithEvents :many
+WITH input AS (
+    SELECT unnest($1::uuid[]) AS id,
+           unnest($2::uuid[]) AS tenant_id,
+           unnest($3::int[]) AS attempt_count
+), lk AS MATERIALIZED (
+    SELECT d.id FROM deliveries d JOIN input i ON i.id = d.id AND i.tenant_id = d.tenant_id AND i.attempt_count = d.attempt_count
+    WHERE d.status IN ('pending', 'retrying') AND (d.locked_until IS NULL OR d.locked_until < now())
+    ORDER BY d.id
+    FOR UPDATE OF d
+), c AS (
+    UPDATE deliveries
+    SET locked_until = now() + make_interval(secs => $4::float8)
+    FROM lk WHERE deliveries.id = lk.id
+    RETURNING deliveries.id, deliveries.event_id, deliveries.attempt_count
+)
+SELECT c.id, c.attempt_count, e.event_type, e.payload, e.occurred_at, e.created_at AS event_created_at
+FROM c JOIN events e ON e.id = c.event_id
+`
+
+type ClaimDeliveriesWithEventsParams struct {
+	Ids           []uuid.UUID
+	TenantIds     []uuid.UUID
+	AttemptCounts []int32
+	LockSecs      float64
+}
+
+type ClaimDeliveriesWithEventsRow struct {
+	ID             uuid.UUID
+	AttemptCount   int32
+	EventType      string
+	Payload        []byte
+	OccurredAt     time.Time
+	EventCreatedAt time.Time
+}
+
+// ClaimDeliveryWithEvent for many jobs in one statement; deliveries that cannot be claimed
+// are left out. Rows are locked in id order so concurrent batches cannot deadlock.
+func (q *Queries) ClaimDeliveriesWithEvents(ctx context.Context, arg ClaimDeliveriesWithEventsParams) ([]ClaimDeliveriesWithEventsRow, error) {
+	rows, err := q.db.Query(ctx, claimDeliveriesWithEvents,
+		arg.Ids,
+		arg.TenantIds,
+		arg.AttemptCounts,
+		arg.LockSecs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClaimDeliveriesWithEventsRow
+	for rows.Next() {
+		var i ClaimDeliveriesWithEventsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AttemptCount,
+			&i.EventType,
+			&i.Payload,
+			&i.OccurredAt,
+			&i.EventCreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const claimDeliveryWithEvent = `-- name: ClaimDeliveryWithEvent :one
 WITH c AS (
     UPDATE deliveries
@@ -521,6 +591,97 @@ func (q *Queries) RecordAttempt(ctx context.Context, arg RecordAttemptParams) (i
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const recordAttempts = `-- name: RecordAttempts :many
+WITH input AS (
+    SELECT unnest($1::uuid[]) AS delivery_id,
+           unnest($2::int[]) AS attempt_count,
+           unnest($3::text[]) AS status,
+           unnest($4::text[]) AS next_attempt_at,
+           unnest($5::text[]) AS dead_reason,
+           unnest($6::uuid[]) AS attempt_id,
+           unnest($7::timestamptz[]) AS started_at,
+           unnest($8::int[]) AS duration_ms,
+           unnest($9::int[]) AS status_code,
+           unnest($10::text[]) AS error_kind,
+           unnest($11::text[]) AS error_message,
+           unnest($12::text[]) AS response_body_snippet
+), lk AS MATERIALIZED (
+    SELECT d.id FROM deliveries d JOIN input i ON i.delivery_id = d.id AND i.attempt_count = d.attempt_count
+    WHERE d.status IN ('pending', 'retrying')
+    ORDER BY d.id
+    FOR UPDATE OF d
+), u AS (
+    UPDATE deliveries
+    SET status = input.status, attempt_count = deliveries.attempt_count + 1,
+        next_attempt_at = NULLIF(input.next_attempt_at, '')::timestamptz, last_attempt_at = now(),
+        last_status_code = input.status_code, last_error = input.error_message,
+        dead_reason = input.dead_reason,
+        succeeded_at = CASE WHEN input.status = 'succeeded' THEN now() ELSE NULL END,
+        locked_until = NULL, updated_at = now()
+    FROM input JOIN lk ON lk.id = input.delivery_id
+    WHERE deliveries.id = input.delivery_id
+    RETURNING deliveries.id, deliveries.tenant_id, input.attempt_id, input.attempt_count, input.started_at,
+              input.duration_ms, input.status_code, input.error_kind, input.error_message, input.response_body_snippet
+), a AS (
+    INSERT INTO delivery_attempts (id, delivery_id, tenant_id, attempt_number, started_at, duration_ms, status_code, error_kind, error_message, response_body_snippet)
+    SELECT u.attempt_id, u.id, u.tenant_id, u.attempt_count + 1, u.started_at, u.duration_ms,
+           u.status_code, u.error_kind, u.error_message, u.response_body_snippet
+    FROM u
+    RETURNING delivery_attempts.delivery_id
+)
+SELECT a.delivery_id FROM a
+`
+
+type RecordAttemptsParams struct {
+	DeliveryIds          []uuid.UUID
+	AttemptCounts        []int32
+	Statuses             []string
+	NextAttemptAts       []string
+	DeadReasons          []string
+	AttemptIds           []uuid.UUID
+	StartedAts           []time.Time
+	DurationsMs          []int32
+	StatusCodes          []int32
+	ErrorKinds           []string
+	ErrorMessages        []string
+	ResponseBodySnippets []string
+}
+
+// RecordAttempt for many jobs in one statement; returns the deliveries that were completed
+// (the others were completed elsewhere). next_attempt_ats holds RFC 3339 times, ” for none.
+func (q *Queries) RecordAttempts(ctx context.Context, arg RecordAttemptsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, recordAttempts,
+		arg.DeliveryIds,
+		arg.AttemptCounts,
+		arg.Statuses,
+		arg.NextAttemptAts,
+		arg.DeadReasons,
+		arg.AttemptIds,
+		arg.StartedAts,
+		arg.DurationsMs,
+		arg.StatusCodes,
+		arg.ErrorKinds,
+		arg.ErrorMessages,
+		arg.ResponseBodySnippets,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var delivery_id uuid.UUID
+		if err := rows.Scan(&delivery_id); err != nil {
+			return nil, err
+		}
+		items = append(items, delivery_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const replayDelivery = `-- name: ReplayDelivery :one

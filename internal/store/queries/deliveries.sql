@@ -38,6 +38,69 @@ SELECT sqlc.arg(attempt_id), u.id, u.tenant_id, sqlc.arg(attempt_count)::int + 1
        sqlc.arg(status_code), sqlc.arg(error_kind), sqlc.arg(error_message), sqlc.arg(response_body_snippet)
 FROM u;
 
+-- name: ClaimDeliveriesWithEvents :many
+-- ClaimDeliveryWithEvent for many jobs in one statement; deliveries that cannot be claimed
+-- are left out. Rows are locked in id order so concurrent batches cannot deadlock.
+WITH input AS (
+    SELECT unnest(sqlc.arg(ids)::uuid[]) AS id,
+           unnest(sqlc.arg(tenant_ids)::uuid[]) AS tenant_id,
+           unnest(sqlc.arg(attempt_counts)::int[]) AS attempt_count
+), lk AS MATERIALIZED (
+    SELECT d.id FROM deliveries d JOIN input i ON i.id = d.id AND i.tenant_id = d.tenant_id AND i.attempt_count = d.attempt_count
+    WHERE d.status IN ('pending', 'retrying') AND (d.locked_until IS NULL OR d.locked_until < now())
+    ORDER BY d.id
+    FOR UPDATE OF d
+), c AS (
+    UPDATE deliveries
+    SET locked_until = now() + make_interval(secs => sqlc.arg(lock_secs)::float8)
+    FROM lk WHERE deliveries.id = lk.id
+    RETURNING deliveries.id, deliveries.event_id, deliveries.attempt_count
+)
+SELECT c.id, c.attempt_count, e.event_type, e.payload, e.occurred_at, e.created_at AS event_created_at
+FROM c JOIN events e ON e.id = c.event_id;
+
+-- name: RecordAttempts :many
+-- RecordAttempt for many jobs in one statement; returns the deliveries that were completed
+-- (the others were completed elsewhere). next_attempt_ats holds RFC 3339 times, '' for none.
+WITH input AS (
+    SELECT unnest(sqlc.arg(delivery_ids)::uuid[]) AS delivery_id,
+           unnest(sqlc.arg(attempt_counts)::int[]) AS attempt_count,
+           unnest(sqlc.arg(statuses)::text[]) AS status,
+           unnest(sqlc.arg(next_attempt_ats)::text[]) AS next_attempt_at,
+           unnest(sqlc.arg(dead_reasons)::text[]) AS dead_reason,
+           unnest(sqlc.arg(attempt_ids)::uuid[]) AS attempt_id,
+           unnest(sqlc.arg(started_ats)::timestamptz[]) AS started_at,
+           unnest(sqlc.arg(durations_ms)::int[]) AS duration_ms,
+           unnest(sqlc.arg(status_codes)::int[]) AS status_code,
+           unnest(sqlc.arg(error_kinds)::text[]) AS error_kind,
+           unnest(sqlc.arg(error_messages)::text[]) AS error_message,
+           unnest(sqlc.arg(response_body_snippets)::text[]) AS response_body_snippet
+), lk AS MATERIALIZED (
+    SELECT d.id FROM deliveries d JOIN input i ON i.delivery_id = d.id AND i.attempt_count = d.attempt_count
+    WHERE d.status IN ('pending', 'retrying')
+    ORDER BY d.id
+    FOR UPDATE OF d
+), u AS (
+    UPDATE deliveries
+    SET status = input.status, attempt_count = deliveries.attempt_count + 1,
+        next_attempt_at = NULLIF(input.next_attempt_at, '')::timestamptz, last_attempt_at = now(),
+        last_status_code = input.status_code, last_error = input.error_message,
+        dead_reason = input.dead_reason,
+        succeeded_at = CASE WHEN input.status = 'succeeded' THEN now() ELSE NULL END,
+        locked_until = NULL, updated_at = now()
+    FROM input JOIN lk ON lk.id = input.delivery_id
+    WHERE deliveries.id = input.delivery_id
+    RETURNING deliveries.id, deliveries.tenant_id, input.attempt_id, input.attempt_count, input.started_at,
+              input.duration_ms, input.status_code, input.error_kind, input.error_message, input.response_body_snippet
+), a AS (
+    INSERT INTO delivery_attempts (id, delivery_id, tenant_id, attempt_number, started_at, duration_ms, status_code, error_kind, error_message, response_body_snippet)
+    SELECT u.attempt_id, u.id, u.tenant_id, u.attempt_count + 1, u.started_at, u.duration_ms,
+           u.status_code, u.error_kind, u.error_message, u.response_body_snippet
+    FROM u
+    RETURNING delivery_attempts.delivery_id
+)
+SELECT a.delivery_id FROM a;
+
 -- name: DeferDelivery :execrows
 -- Reschedules without counting an attempt (circuit open).
 UPDATE deliveries
