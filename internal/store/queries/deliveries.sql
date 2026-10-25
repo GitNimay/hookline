@@ -1,11 +1,11 @@
 -- name: CreateDeliveries :exec
--- One delivery per (event, endpoint); re-running for the same event is a no-op.
+-- One delivery per (event, endpoint) for a whole batch of events; existing pairs are kept.
 INSERT INTO deliveries (id, tenant_id, event_id, endpoint_id, status)
-SELECT unnest(sqlc.arg(ids)::uuid[]), sqlc.arg(tenant_id)::uuid, sqlc.arg(event_id)::uuid, unnest(sqlc.arg(endpoint_ids)::uuid[]), 'pending'
+SELECT unnest(sqlc.arg(ids)::uuid[]), unnest(sqlc.arg(tenant_ids)::uuid[]), unnest(sqlc.arg(event_ids)::uuid[]), unnest(sqlc.arg(endpoint_ids)::uuid[]), 'pending'
 ON CONFLICT (event_id, endpoint_id) DO NOTHING;
 
--- name: ListEventDeliveries :many
-SELECT * FROM deliveries WHERE event_id = $1;
+-- name: ListEventsDeliveries :many
+SELECT * FROM deliveries WHERE event_id = ANY(sqlc.arg(event_ids)::uuid[]);
 
 -- name: ClaimDeliveryWithEvent :one
 -- ClaimDelivery plus the event payload, in one round trip.

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/GitNimay/hookline/gen/hookline/v1"
@@ -59,113 +59,154 @@ func (d *Dispatcher) match(ctx context.Context, tenant, typ string) ([]uuid.UUID
 	return ids, nil
 }
 
-// Handle processes one event message. The message is acked only after deliveries are
-// committed and their jobs published; any failure naks with a growing delay.
-func (d *Dispatcher) Handle(ctx context.Context, msg jetstream.Msg) {
-	ctx = telemetry.Extract(ctx, msg.Headers())
-	ctx, span := telemetry.Tracer.Start(ctx, "dispatch")
-	defer span.End()
-	if err := d.handle(ctx, msg); err != nil {
-		var n uint64 = 1
-		if md, merr := msg.Metadata(); merr == nil {
-			n = md.NumDelivered
-		}
-		delay := min(time.Duration(1<<min(n, 6))*time.Second, time.Minute)
-		d.Log.WarnContext(ctx, "dispatch failed; will retry", "err", err, "delay", delay)
-		span.RecordError(err)
-		_ = msg.NakWithDelay(delay)
-		return
-	}
-	_ = msg.Ack()
+// dispatchBatch is how many events one fetch takes; they share one insert and one publish.
+const dispatchBatch = 100
+
+type eventMsg struct {
+	msg      jetstream.Msg
+	ctx      context.Context
+	span     trace.Span
+	job      *pb.EventJob
+	eventID  uuid.UUID
+	tenantID uuid.UUID
 }
 
-func (d *Dispatcher) handle(ctx context.Context, msg jetstream.Msg) error {
-	var job pb.EventJob
-	if err := proto.Unmarshal(msg.Data(), &job); err != nil {
-		d.Log.ErrorContext(ctx, "bad event job; dropping", "err", err)
-		return nil // poison message: retrying cannot help
+// HandleBatch fans out a batch of events with one insert, one read-back and one async
+// publish. Messages are acked only after their deliveries are committed and their jobs
+// published; any failure naks the whole batch with a growing delay (all steps are idempotent).
+func (d *Dispatcher) HandleBatch(ctx context.Context, msgs []jetstream.Msg) {
+	var evs []eventMsg
+	for _, m := range msgs {
+		ectx, span := telemetry.Tracer.Start(telemetry.Extract(ctx, m.Headers()), "dispatch")
+		defer span.End()
+		var job pb.EventJob
+		eventID, tenantID, ok := uuid.Nil, uuid.Nil, proto.Unmarshal(m.Data(), &job) == nil
+		if ok {
+			var err1, err2 error
+			eventID, err1 = domain.ParseID(domain.PrefixEvent, job.EventId)
+			tenantID, err2 = domain.ParseID(domain.PrefixTenant, job.TenantId)
+			ok = err1 == nil && err2 == nil
+		}
+		if !ok {
+			d.Log.ErrorContext(ectx, "bad event job; dropping") // poison: retrying cannot help
+			_ = m.Ack()
+			continue
+		}
+		evs = append(evs, eventMsg{msg: m, ctx: ectx, span: span, job: &job, eventID: eventID, tenantID: tenantID})
 	}
-	eventID, err1 := domain.ParseID(domain.PrefixEvent, job.EventId)
-	tenantID, err2 := domain.ParseID(domain.PrefixTenant, job.TenantId)
-	if err1 != nil || err2 != nil {
-		d.Log.ErrorContext(ctx, "bad ids in event job; dropping", "event_id", job.EventId)
+	if len(evs) == 0 {
+		return
+	}
+	if err := d.dispatch(ctx, evs); err != nil {
+		for _, e := range evs {
+			var n uint64 = 1
+			if md, merr := e.msg.Metadata(); merr == nil {
+				n = md.NumDelivered
+			}
+			e.span.RecordError(err)
+			_ = e.msg.NakWithDelay(min(time.Duration(1<<min(n, 6))*time.Second, time.Minute))
+		}
+		d.Log.Warn("dispatch failed; will retry", "events", len(evs), "err", err)
+		return
+	}
+	for _, e := range evs {
+		_ = e.msg.Ack()
+	}
+}
+
+func (d *Dispatcher) dispatch(ctx context.Context, evs []eventMsg) error {
+	var p store.CreateDeliveriesParams
+	var eventIDs []uuid.UUID
+	byEvent := make(map[uuid.UUID]*eventMsg, len(evs))
+	for i := range evs {
+		e := &evs[i]
+		eps, err := d.match(ctx, e.job.TenantId, e.job.EventType)
+		if err != nil {
+			return err
+		}
+		if len(eps) == 0 {
+			telemetry.EventsUnmatched.Inc()
+			continue
+		}
+		byEvent[e.eventID] = e
+		eventIDs = append(eventIDs, e.eventID)
+		for _, ep := range eps {
+			p.Ids = append(p.Ids, domain.NewID())
+			p.TenantIds = append(p.TenantIds, e.tenantID)
+			p.EventIds = append(p.EventIds, e.eventID)
+			p.EndpointIds = append(p.EndpointIds, ep)
+		}
+	}
+	if len(eventIDs) == 0 {
 		return nil
-	}
-	eps, err := d.match(ctx, job.TenantId, job.EventType)
-	if err != nil {
-		return err
-	}
-	if len(eps) == 0 {
-		telemetry.EventsUnmatched.Inc()
-		return nil
-	}
-	ids := make([]uuid.UUID, len(eps))
-	for i := range eps {
-		ids[i] = domain.NewID()
 	}
 	q := store.New(d.Pool)
-	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := q.CreateDeliveries(dctx, store.CreateDeliveriesParams{Ids: ids, TenantID: tenantID, EventID: eventID, EndpointIds: eps}); err != nil {
+	if err := q.CreateDeliveries(dctx, p); err != nil {
 		return err
 	}
-	// Read back: on a redelivered event the rows already exist with their original IDs.
-	rows, err := q.ListEventDeliveries(dctx, eventID)
+	// Read back: for redelivered events the rows already exist with their original IDs.
+	rows, err := q.ListEventsDeliveries(dctx, eventIDs)
 	if err != nil {
 		return err
 	}
-	// Publish all jobs of the fan-out at once and wait for every ack.
 	var msgs []*nats.Msg
 	var msgIDs []string
+	created := map[string]float64{}
 	for _, r := range rows {
 		if r.Status != domain.StatusPending || r.AttemptCount != 0 || r.ReplayCount != 0 {
 			continue // already in progress or replayed; those paths publish their own jobs
 		}
 		tenant, dj, id := jobFor(ref(r), "d")
-		m, err := queue.Msg(ctx, domain.DeliveriesSubject(tenant), dj)
+		m, err := queue.Msg(byEvent[r.EventID].ctx, domain.DeliveriesSubject(tenant), dj)
 		if err != nil {
 			return err
 		}
 		msgs, msgIDs = append(msgs, m), append(msgIDs, id)
+		created[tenant]++
 	}
 	if _, err := d.Queue.PublishAll(ctx, msgs, msgIDs); err != nil {
-		return err // naked and redelivered; republishing the acked ones is deduplicated
+		return err // republishing the acked ones is deduplicated by message ID
 	}
-	telemetry.DeliveriesCreated.WithLabelValues(job.TenantId).Add(float64(len(msgs)))
+	for tenant, n := range created {
+		telemetry.DeliveriesCreated.WithLabelValues(tenant).Add(n)
+	}
 	return nil
 }
 
-// Run consumes events with bounded concurrency until ctx ends, then waits for in-flight work.
+// Run fetches events in batches on Concurrency/16 loops until ctx ends. A batch in progress
+// always finishes: its messages are acked or naked, never abandoned.
 func (d *Dispatcher) Run(ctx context.Context) error {
 	cons, err := d.Queue.EnsureDispatcherConsumer(ctx)
 	if err != nil {
 		return err
 	}
-	it, err := cons.Messages(jetstream.PullMaxMessages(d.Concurrency))
-	if err != nil {
-		return err
-	}
-	defer context.AfterFunc(ctx, it.Stop)()
-	sem := make(chan struct{}, d.Concurrency)
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	for {
-		msg, err := it.Next()
-		if errors.Is(err, jetstream.ErrMsgIteratorClosed) || ctx.Err() != nil {
-			return nil
-		}
-		if err != nil {
-			d.Log.Warn("fetch events", "err", err)
-			continue
-		}
-		sem <- struct{}{}
+	for range max(1, d.Concurrency/16) {
 		wg.Add(1)
 		go func() {
-			defer func() { <-sem; wg.Done() }()
-			// Work finishes even during shutdown; the message is acked or naked, never abandoned.
-			d.Handle(context.WithoutCancel(ctx), msg)
+			defer wg.Done()
+			for ctx.Err() == nil {
+				batch, err := cons.Fetch(dispatchBatch, jetstream.FetchMaxWait(time.Second))
+				if err != nil {
+					if !sleep(ctx, time.Second) {
+						return
+					}
+					continue
+				}
+				var msgs []jetstream.Msg
+				for m := range batch.Messages() {
+					msgs = append(msgs, m)
+				}
+				if len(msgs) > 0 {
+					d.HandleBatch(context.WithoutCancel(ctx), msgs)
+				}
+			}
 		}()
 	}
+	return nil
 }
 
 // RunDispatcher wires and runs the dispatcher service.

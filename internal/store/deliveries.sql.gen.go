@@ -204,23 +204,23 @@ func (q *Queries) CountRetryingByTenant(ctx context.Context) ([]CountRetryingByT
 
 const createDeliveries = `-- name: CreateDeliveries :exec
 INSERT INTO deliveries (id, tenant_id, event_id, endpoint_id, status)
-SELECT unnest($1::uuid[]), $2::uuid, $3::uuid, unnest($4::uuid[]), 'pending'
+SELECT unnest($1::uuid[]), unnest($2::uuid[]), unnest($3::uuid[]), unnest($4::uuid[]), 'pending'
 ON CONFLICT (event_id, endpoint_id) DO NOTHING
 `
 
 type CreateDeliveriesParams struct {
 	Ids         []uuid.UUID
-	TenantID    uuid.UUID
-	EventID     uuid.UUID
+	TenantIds   []uuid.UUID
+	EventIds    []uuid.UUID
 	EndpointIds []uuid.UUID
 }
 
-// One delivery per (event, endpoint); re-running for the same event is a no-op.
+// One delivery per (event, endpoint) for a whole batch of events; existing pairs are kept.
 func (q *Queries) CreateDeliveries(ctx context.Context, arg CreateDeliveriesParams) error {
 	_, err := q.db.Exec(ctx, createDeliveries,
 		arg.Ids,
-		arg.TenantID,
-		arg.EventID,
+		arg.TenantIds,
+		arg.EventIds,
 		arg.EndpointIds,
 	)
 	return err
@@ -427,12 +427,12 @@ func (q *Queries) ListDeliveries(ctx context.Context, arg ListDeliveriesParams) 
 	return items, nil
 }
 
-const listEventDeliveries = `-- name: ListEventDeliveries :many
-SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, replay_count, next_attempt_at, last_attempt_at, last_status_code, last_error, dead_reason, succeeded_at, locked_until, created_at, updated_at FROM deliveries WHERE event_id = $1
+const listEventsDeliveries = `-- name: ListEventsDeliveries :many
+SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, replay_count, next_attempt_at, last_attempt_at, last_status_code, last_error, dead_reason, succeeded_at, locked_until, created_at, updated_at FROM deliveries WHERE event_id = ANY($1::uuid[])
 `
 
-func (q *Queries) ListEventDeliveries(ctx context.Context, eventID uuid.UUID) ([]Delivery, error) {
-	rows, err := q.db.Query(ctx, listEventDeliveries, eventID)
+func (q *Queries) ListEventsDeliveries(ctx context.Context, eventIds []uuid.UUID) ([]Delivery, error) {
+	rows, err := q.db.Query(ctx, listEventsDeliveries, eventIds)
 	if err != nil {
 		return nil, err
 	}
