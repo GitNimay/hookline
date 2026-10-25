@@ -10,3 +10,9 @@ deploy/values/secrets*.yaml
 k6-*.json
 k6-*.txt
 bench-*.txt
+
+# internal notes, kept local only
+PROGRESS.md
+docs/adr/
+docs/benchmarks.md
+docs/homeserver-setup.md
