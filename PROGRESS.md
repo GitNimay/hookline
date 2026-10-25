@@ -1,38 +1,30 @@
 # Progress
 
-Status of each milestone from the build plan. Updated at the end of every work session.
-
 | # | Milestone | Status |
 | --- | --- | --- |
 | 0 | Foundation | done |
 | 1 | Walking skeleton | done |
-| 2 | Reliability core | code done; scenario tests in progress |
-| 3 | Security and signing | code done; isolation tests in progress |
-| 4 | Protection and fairness | code done; scenario tests in progress |
-| 5 | Observability | metrics and tracing done; dashboards and alerts pending |
-| 6 | Kubernetes | pending |
-| 7 | Proof | pending |
-| 8 | Home server | pending |
-| 9 | Polish | pending |
+| 2 | Reliability core | done (integration + e2e scenarios 2, 3, 6 pass; worker kill loses nothing) |
+| 3 | Security and signing | done (scenarios 11, 12, isolation pass; official Standard Webhooks lib verifies) |
+| 4 | Protection and fairness | done (scenarios 8, 9, 10 pass); scenario 7 (noisy neighbour) not measured yet |
+| 5 | Observability | done (one event = one trace; dashboards; forced failure fired HooklineServiceDown) |
+| 6 | Kubernetes | chart, helmfile, k3d, Tiltfile written and lint/render clean; not yet deployed end to end |
+| 7 | Proof | k6 scripts and Chaos Mesh experiments written; benchmarks not run |
+| 8 | Home server | values, setup guide, release workflow written; not executed |
+| 9 | Polish | pending (README finish, benchmarks.md, demo GIF) |
 
-## Session 1 (2026-10-25)
+## Session 1 (2026-10-25) results
 
-Done
-- Repo layout, Go module, Makefile, golangci-lint config, Dockerfile, `.env.example`, CI workflow.
-- Protos for every service (buf lint clean), grpc-gateway REST, OpenAPI in `gen/openapi`.
-- Schema migration for all tables; sqlc queries.
-- All five services, chaos customer and `hookctl` (migrate, seed, send, replay, chaos, verify).
-- Outbox relay, dispatcher fan-out, worker with claim locks, Standard Webhooks signing, SSRF dialer,
-  retry schedule with jitter, response classification, circuit breaker, GCRA rate limits,
-  per-tenant consumers with round-robin fetching, scheduler (due retries, reconciliation,
-  auto-disable, retention).
-- Docker Compose stack; `make compose-up seed` then `hookctl send` delivers every event,
-  verified by the official Standard Webhooks library in the chaos customer.
+- e2e on Compose: 11/12 pass. 10,000 events x 3 endpoints delivered, 0 missing, 0 duplicates.
+  Worker kill + NATS restart under load: 5,000/5,000, 0 duplicates.
+- Failing: `TestDeadLetterAndReplay` - replayed deliveries wait for the endpoint's open circuit breaker.
 
-Known gaps
-- Integration tests (testcontainers) and e2e scenario tests not written yet.
-- `-race` runs only in CI/WSL2 (no cgo on native Windows; ADR-009).
+## Next steps (in order)
 
-Next
-- Integration tests for store, relay, worker path; e2e scenario suite.
-- Dashboards, alert rules.
+1. Reset the endpoint's breaker on ReplayDelivery / ReplayEndpoint / EnableEndpoint (`Breaker.Reset`: DEL key + probe key).
+2. Breaker contention: every attempt runs a WATCH transaction on one Redis key per endpoint, limiting
+   fan-out to ~600 deliveries/s. Buffer non-probe results per pod and flush per endpoint every 100 ms
+   (`Observe` + `FlushLoop`); keep probes synchronous.
+3. k3d: the full stack filled drive C: (Docker Desktop's disk image lives there). Move Docker Desktop's
+   disk image to D: (Settings > Resources > Advanced), then `make cluster-up deploy-local seed demo`.
+4. Run k6 steady/spike/noisy-neighbour, write `docs/benchmarks.md`, finish README.
