@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install code generators
+        run: make tools
+      - name: Generated code is up to date
+        run: make gen && git diff --exit-code
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+          install-mode: goinstall
+      - name: buf breaking
+        if: github.event_name == 'pull_request'
+        run: buf breaking --against ".git#branch=origin/main"
+      - name: Unit tests (race)
+        run: go test -race -count=1 -coverprofile=coverage.out ./internal/... ./cmd/...
+      - name: Coverage of core packages
+        run: |
+          go test -coverprofile=core.out ./internal/delivery ./internal/breaker ./internal/signing ./internal/ssrf
+          go tool cover -func=core.out | tail -1
+      - name: govulncheck
+        run: govulncheck ./...
+
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Integration tests (testcontainers)
+        run: go test -race -count=1 -tags=integration -timeout=15m ./...
+
+  helm:
+    runs-on: ubuntu-24.04
+    if: hashFiles('deploy/helm/hookline/Chart.yaml') != ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.19.0
+      - name: Lint and render the chart with every values file
+        run: |
+          helm lint deploy/helm/hookline
+          for v in deploy/values/local.yaml deploy/values/homeserver.yaml; do
+            helm lint deploy/helm/hookline -f "$v"
+            helm template hookline deploy/helm/hookline -f "$v" > /dev/null
+          done
+
+  images:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        service: [ingest, control, dispatcher, worker, scheduler, chaos-customer, hookctl]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          build-args: SERVICE=${{ matrix.service }}
+          tags: hookline/${{ matrix.service }}:ci
+          load: true
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+      - name: Trivy scan (fail on critical)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
+            image --exit-code 1 --severity CRITICAL --ignore-unfixed hookline/${{ matrix.service }}:ci

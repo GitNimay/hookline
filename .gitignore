@@ -1,0 +1,8 @@
+.env
+.hookline/
+bin/
+dist/
+coverage.out
+loadtest/results/
+*.test
+deploy/values/secrets*.yaml

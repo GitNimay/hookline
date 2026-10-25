@@ -1,0 +1,35 @@
+version: "2"
+run:
+  timeout: 5m
+linters:
+  enable:
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - gocritic
+    - gosec
+    - noctx
+    - revive
+  settings:
+    gosec:
+      excludes:
+        - G115 # int conversions are bounded by validation
+    revive:
+      rules:
+        - name: exported
+        - name: unused-parameter
+          disabled: true
+  exclusions:
+    generated: strict
+    paths:
+      - gen/
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose]
+      # hookctl is a CLI that calls URLs the operator gives it, one command at a time.
+      - path: cmd/hookctl/
+        linters: [contextcheck, gosec]
+formatters:
+  enable:
+    - gofmt
+    - goimports

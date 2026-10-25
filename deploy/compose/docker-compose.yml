@@ -1,0 +1,182 @@
+# Hookline stage 1a: everything on one machine. Run via `make compose-up` (uses ../../.env).
+name: hookline
+
+x-build: &build
+  context: ../..
+  dockerfile: Dockerfile
+  args: &buildargs
+    VERSION: ${VERSION:-dev}
+    COMMIT: ${COMMIT:-none}
+
+x-env: &env
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  LOG_FORMAT: json
+  DATABASE_URL: postgres://hookline:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/hookline?sslmode=disable
+  NATS_URL: nats://nats:4222
+  REDIS_ADDR: redis:6379
+  HOOKLINE_MASTER_KEY: ${HOOKLINE_MASTER_KEY:?set in .env}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  DRAIN_DELAY: 1s
+
+x-service: &service
+  restart: unless-stopped
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  healthcheck:
+    test: ["CMD", "/app", "healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+  depends_on: &deps
+    migrate: { condition: service_completed_successfully }
+    nats: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: hookline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: hookline
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB", "-c", "synchronous_commit=on"]
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hookline -d hookline"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  nats:
+    image: nats:2.12.6-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports: ["4222:4222", "8222:8222"]
+    volumes: [natsdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- 'http://localhost:8222/healthz?js-enabled-only=true' >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:8.8.0-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build: { <<: *build, args: { <<: *buildargs, SERVICE: hookctl } }
+    image: hookline/hookctl:dev
+    command: ["migrate", "up"]
+    environment: *env
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  control:
+    <<: *service
+    build: { <<: *build, args: { <<: *buildargs, SERVICE: control } }
+    image: hookline/control:dev
+    environment:
+      <<: *env
+      HOOKLINE_ADMIN_KEY: ${HOOKLINE_ADMIN_KEY:?set in .env}
+      SSRF_ALLOWLIST: chaos-customer
+    ports: ["8082:8080"]
+
+  ingest:
+    <<: *service
+    build: { <<: *build, args: { <<: *buildargs, SERVICE: ingest } }
+    image: hookline/ingest:dev
+    environment: *env
+    ports: ["8080:8080"]
+
+  dispatcher:
+    <<: *service
+    build: { <<: *build, args: { <<: *buildargs, SERVICE: dispatcher } }
+    image: hookline/dispatcher:dev
+    environment:
+      <<: *env
+      CONTROL_GRPC_ADDR: control:9090
+    depends_on:
+      <<: *deps
+      control: { condition: service_healthy }
+
+  worker:
+    <<: *service
+    build: { <<: *build, args: { <<: *buildargs, SERVICE: worker } }
+    image: hookline/worker:dev
+    environment:
+      <<: *env
+      RETRY_SCHEDULE: ${RETRY_SCHEDULE:-demo}
+      SSRF_ALLOWLIST: chaos-customer
+      WORKER_CONCURRENCY: "200"
+
+  scheduler:
+    <<: *service
+    build: { <<: *build, args: { <<: *buildargs, SERVICE: scheduler } }
+    image: hookline/scheduler:dev
+    environment:
+      <<: *env
+      RECONCILE_PENDING_AFTER: ${RECONCILE_PENDING_AFTER:-10m}
+
+  chaos-customer:
+    <<: *service
+    build: { <<: *build, args: { <<: *buildargs, SERVICE: chaos-customer } }
+    image: hookline/chaos-customer:dev
+    environment:
+      LOG_FORMAT: json
+    ports: ["9000:8080"]
+    depends_on: {}
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.17.3
+    command: ["-varz", "-jsz=all", "-connz", "http://nats:8222"]
+    depends_on:
+      nats: { condition: service_healthy }
+
+  prometheus:
+    image: prom/prometheus:v3.12.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=2d", "--web.enable-lifecycle"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../alerts:/etc/prometheus/alerts:ro
+    ports: ["9091:9090"]
+
+  alertmanager:
+    image: prom/alertmanager:v0.30.0
+    volumes: [./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro]
+    ports: ["9093:9093"]
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+
+  # Optional: `docker compose --profile tracing up` and set OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+  tempo:
+    image: grafana/tempo:2.10.0
+    profiles: [tracing]
+    command: ["-config.file=/etc/tempo.yml"]
+    volumes: [./tempo.yml:/etc/tempo.yml:ro]
+    ports: ["3200:3200"]
+
+  loki:
+    image: grafana/loki:3.7.0
+    profiles: [tracing]
+    ports: ["3100:3100"]
+
+volumes:
+  pgdata:
+  natsdata:

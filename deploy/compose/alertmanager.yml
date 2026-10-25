@@ -1,0 +1,11 @@
+# Alerts go to the chaos customer's /alerts sink locally.
+route:
+  receiver: sink
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+receivers:
+  - name: sink
+    webhook_configs:
+      - url: http://chaos-customer:8080/alerts
+        send_resolved: true
