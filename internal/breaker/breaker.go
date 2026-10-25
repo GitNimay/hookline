@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -198,10 +199,12 @@ func (b *Breaker) Record(ctx context.Context, ep string, now time.Time, success,
 		return err
 	}
 	var err error
-	for range 5 {
+	// Optimistic concurrency: on conflict, back off with jitter and retry.
+	for i := range 50 {
 		if err = b.rdb.Watch(ctx, txf, key(ep)); !errors.Is(err, redis.TxFailedErr) {
 			return transition, err
 		}
+		time.Sleep(time.Duration(rand.IntN(1000*(min(i, 10)+1))) * time.Microsecond) //nolint:gosec // jitter
 	}
 	return "", err
 }

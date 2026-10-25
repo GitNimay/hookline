@@ -44,6 +44,10 @@ type Worker struct {
 	Schedule    delivery.Schedule
 	Log         *slog.Logger
 	Concurrency int
+	// RefreshEvery is how often the tenant consumer list is reloaded (default 10 s).
+	RefreshEvery time.Duration
+	// LockFor is how long a claimed delivery stays locked: longer than one attempt, shorter than AckWait (default 30 s).
+	LockFor time.Duration
 
 	endpoints *ttlCache[uuid.UUID, workerEndpoint]
 }
@@ -57,11 +61,14 @@ type workerEndpoint struct {
 // NewWorker builds a worker.
 func NewWorker(w Worker) *Worker {
 	w.endpoints = newCache[uuid.UUID, workerEndpoint](5 * time.Second)
+	if w.LockFor == 0 {
+		w.LockFor = 30 * time.Second
+	}
+	if w.RefreshEvery == 0 {
+		w.RefreshEvery = 10 * time.Second
+	}
 	return &w
 }
-
-// lockFor is how long a claimed delivery stays locked; longer than one attempt, shorter than AckWait.
-const lockFor = 30 * time.Second
 
 // perTenantFetch is how many jobs one tenant may take per round-robin turn.
 const perTenantFetch = 10
@@ -77,7 +84,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	var refreshed time.Time
 	start := 0
 	for ctx.Err() == nil {
-		if time.Since(refreshed) > 10*time.Second {
+		if time.Since(refreshed) > w.RefreshEvery {
 			names = w.refreshConsumers(ctx, consumers)
 			refreshed = time.Now()
 		}
@@ -283,7 +290,7 @@ func (w *Worker) handle(ctx context.Context, job *pb.DeliveryJob, log *slog.Logg
 		}
 	}
 
-	d, err := q.ClaimDelivery(dbctx, store.ClaimDeliveryParams{ID: ids.delivery, TenantID: ids.tenant, AttemptCount: expected, LockSecs: lockFor.Seconds()})
+	d, err := q.ClaimDelivery(dbctx, store.ClaimDeliveryParams{ID: ids.delivery, TenantID: ids.tenant, AttemptCount: expected, LockSecs: w.LockFor.Seconds()})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return w.notClaimed(dbctx, q, ids, expected)
 	}
